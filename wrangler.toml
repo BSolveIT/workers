@@ -1,5 +1,6 @@
-name               = "faq-proxy"
-account_id         = "a751b42821042f55c36a770565499abb"
-main               = "src/index.js"         # ← points to your Worker code
+name = "faq-proxy"
+account_id = "a751b42821042f55c36a770565499abb"
+main = "src/index.js"
 compatibility_date = "2025-06-08"
-workers_dev        = true
+workers_dev = true
+node_compat = true  # ← ADD THIS LINE! It lets you use npm packages
