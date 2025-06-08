@@ -2,11 +2,8 @@
   "name": "faq-proxy",
   "version": "1.0.4",
   "type": "module",
-  "dependencies": {
-    "node-html-parser": "^6.1.12"
-  },
   "devDependencies": {
-    "wrangler": "^3.25.0"
+    "wrangler": "^3.99.0"
   },
   "scripts": {
     "dev": "wrangler dev",
