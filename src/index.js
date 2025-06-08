@@ -1,12 +1,16 @@
-import { parse }           from 'node-html-parser';
-import { load as cheerio } from 'cheerio';
+import { parse } from 'node-html-parser';
+
 /**
- * FAQ Schema Extraction Proxy Worker - Fixed for Unquoted Attributes
- * Handles both quoted and unquoted HTML attributes
+ * FAQ Schema Extraction Proxy Worker - HTML Parser Version
+ * Uses node-html-parser for robust HTML parsing instead of regex
  */
 addEventListener('fetch', e => e.respondWith(handleRequest(e.request)));
 
 async function handleRequest(request) {
+  // Extract origin/referer early for logging
+  const origin = request.headers.get('Origin');
+  const referer = request.headers.get('Referer');
+  
   const cors = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
@@ -15,6 +19,31 @@ async function handleRequest(request) {
   
   if (request.method === 'OPTIONS') {
     return new Response(null, { headers: cors });
+  }
+
+  // Security: Origin/Referer checking
+  const allowedOrigins = [
+    'https://365i.co.uk',
+    'https://www.365i.co.uk',
+    'https://staging.365i.co.uk',
+    'http://localhost:3000', // For local development
+    'http://localhost:8080'  // For local development
+  ];
+  
+  // Check if request comes from allowed origins (if origin header exists)
+  if (origin && !allowedOrigins.some(allowed => origin.startsWith(allowed))) {
+    console.log(`Blocked request from unauthorized origin: ${origin}`);
+    return new Response(JSON.stringify({ 
+      error: 'Unauthorized origin', 
+      success: false,
+      metadata: {
+        warning: "This service is for FAQ extraction only. Abuse will result in blocking.",
+        terms: "By using this service, you agree not to violate any website's terms of service."
+      }
+    }), {
+      status: 403,
+      headers: { 'Content-Type': 'application/json', ...cors },
+    });
   }
 
   const url = new URL(request.url).searchParams.get('url');
@@ -28,136 +57,228 @@ async function handleRequest(request) {
     });
   }
 
-  let resp;
   try {
-    const u = new URL(url);
-    u.searchParams.append('_cb', Date.now());
-    resp = await fetch(u.toString(), {
+    const targetUrl = new URL(url);
+    
+    // Security: Block internal/private IPs and localhost
+    const hostname = targetUrl.hostname;
+    
+    const blockedPatterns = [
+      /^localhost$/i,
+      /^127\./,
+      /^10\./,
+      /^172\.(1[6-9]|2[0-9]|3[0-1])\./,
+      /^192\.168\./,
+      /\.local$/i,
+      /^0\.0\.0\.0$/
+    ];
+    
+    if (blockedPatterns.some(pattern => pattern.test(hostname))) {
+      console.log(`Blocked request to internal/private URL: ${hostname}`);
+      return new Response(JSON.stringify({ 
+        error: 'Internal/private URLs not allowed', 
+        success: false,
+        metadata: {
+          warning: "This service cannot access internal or private network addresses.",
+          terms: "By using this service, you agree not to violate any website's terms of service."
+        }
+      }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json', ...cors },
+      });
+    }
+    
+    // Log the extraction request
+    console.log(`FAQ extraction requested: ${url} from ${requestOrigin} at ${new Date().toISOString()}`);
+    
+    // Keep origin/referer for logging
+    const requestOrigin = origin || referer || 'unknown origin';
+    
+    // Add cache buster
+    targetUrl.searchParams.append('_cb', Date.now());
+    
+    // Fetch with timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+    
+    const resp = await fetch(targetUrl.toString(), {
+      signal: controller.signal,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'text/html,application/xhtml+xml',
         'Cache-Control': 'no-cache',
       },
       cf: { cacheTtl: 0, cacheEverything: false },
+    }).catch(err => {
+      if (err.name === 'AbortError') {
+        console.error(`Request timeout for ${url} after 10 seconds`);
+        throw new Error('Request timeout - target site took too long to respond');
+      }
+      throw err;
     });
+    
+    clearTimeout(timeoutId);
+    
+    if (!resp.ok) {
+      return new Response(JSON.stringify({ 
+        error: `Fetch failed: ${resp.status}`, 
+        success: false 
+      }), {
+        status: resp.status,
+        headers: { 'Content-Type': 'application/json', ...cors },
+      });
+    }
+    
+    const ct = resp.headers.get('Content-Type') || '';
+    if (!ct.includes('text/html')) {
+      return new Response(JSON.stringify({ 
+        error: 'Not HTML', 
+        success: false 
+      }), {
+        status: 415,
+        headers: { 'Content-Type': 'application/json', ...cors },
+      });
+    }
+    
+    const html = await resp.text();
+    
+    // Check HTML size limit (5MB)
+    if (html.length > 5 * 1024 * 1024) {
+      return new Response(JSON.stringify({ 
+        error: 'HTML too large (>5MB)', 
+        success: false 
+      }), {
+        status: 413,
+        headers: { 'Content-Type': 'application/json', ...cors },
+      });
+    }
+    
+    // Parse HTML
+    const root = parse(html, {
+      lowerCaseTagName: false,
+      comment: false,
+      blockTextElements: {
+        script: false,
+        noscript: false,
+        style: false,
+      }
+    });
+    
+    const title = root.querySelector('title')?.text || '';
+    let allFaqs = [];
+    
+    // 1) Try JSON-LD
+    try {
+      const jsonLdFaqs = extractJsonLd(root);
+      allFaqs = allFaqs.concat(jsonLdFaqs);
+    } catch (e) {
+      console.error('JSON-LD extraction failed:', e);
+    }
+    
+    // 2) Try Microdata
+    try {
+      const microdataFaqs = extractMicrodata(root);
+      allFaqs = allFaqs.concat(microdataFaqs);
+    } catch (e) {
+      console.error('Microdata extraction failed:', e);
+    }
+    
+    // 3) Try RDFa
+    try {
+      const rdfaFaqs = extractRdfa(root);
+      allFaqs = allFaqs.concat(rdfaFaqs);
+    } catch (e) {
+      console.error('RDFa extraction failed:', e);
+    }
+    
+    // Deduplicate
+    allFaqs = dedupe(allFaqs);
+    
+    if (allFaqs.length > 0) {
+      console.log(`Successfully extracted ${allFaqs.length} FAQs from ${url}`);
+      return new Response(JSON.stringify({
+        success: true,
+        source: url,
+        faqs: allFaqs,
+        metadata: { 
+          extractionMethod: 'html-parser', 
+          totalExtracted: allFaqs.length, 
+          title: title,
+          terms: "By using this service, you agree not to violate any website's terms of service."
+        }
+      }), { 
+        headers: { 'Content-Type': 'application/json', ...cors } 
+      });
+    }
+    
+    // Check if markup exists
+    const hasFaqMarkup = html.includes('schema.org/FAQPage') || 
+                         html.includes('typeof="FAQPage"') ||
+                         html.includes('"@type":"FAQPage"');
+    
+    if (hasFaqMarkup) {
+      console.warn(`FAQ markup detected but extraction failed for ${url}`);
+      return new Response(JSON.stringify({
+        success: false,
+        source: url,
+        error: "Page contains FAQ markup but extraction failed. The structure might be non-standard.",
+        metadata: {
+          title: title,
+          extractionMethod: "failed",
+          terms: "By using this service, you agree not to violate any website's terms of service."
+        }
+      }), {
+        headers: { 'Content-Type': 'application/json', ...cors }
+      });
+    }
+    
+    // No FAQs found
+    console.log(`No FAQ markup found on ${url}`);
+    return new Response(JSON.stringify({
+      success: false,
+      source: url,
+      faqs: [],
+      metadata: { 
+        extractionMethod: 'none', 
+        title: title,
+        message: "No FAQ schema markup found on this page",
+        terms: "By using this service, you agree not to violate any website's terms of service."
+      }
+    }), { 
+      headers: { 'Content-Type': 'application/json', ...cors } 
+    });
+    
   } catch (err) {
+    console.error(`Worker error for URL ${url} from ${origin || referer || 'unknown origin'}: ${err.message}`, err.stack);
     return new Response(JSON.stringify({ 
-      error: err.message, 
-      success: false 
+      error: err.message || 'Internal error', 
+      success: false,
+      metadata: {
+        warning: "This service is for FAQ extraction only. Abuse will result in blocking.",
+        terms: "By using this service, you agree not to violate any website's terms of service."
+      }
     }), {
       status: 500,
       headers: { 'Content-Type': 'application/json', ...cors },
     });
   }
-  
-  if (!resp.ok) {
-    return new Response(JSON.stringify({ 
-      error: `Fetch failed: ${resp.status}`, 
-      success: false 
-    }), {
-      status: resp.status,
-      headers: { 'Content-Type': 'application/json', ...cors },
-    });
-  }
-  
-  const ct = resp.headers.get('Content-Type') || '';
-  if (!ct.includes('text/html')) {
-    return new Response(JSON.stringify({ 
-      error: 'Not HTML', 
-      success: false 
-    }), {
-      status: 415,
-      headers: { 'Content-Type': 'application/json', ...cors },
-    });
-  }
-
-  const html = await resp.text();
-  const title = extractTitle(html);
-
-  // 1) Try JSON-LD
-  const jsonLdFaqs = extractJsonLd(html);
-  if (jsonLdFaqs.length) {
-    return createResponse(jsonLdFaqs, 'json-ld', title, url, cors);
-  }
-
-  // 2) Try Microdata with unquoted attribute support
-  const microdataFaqs = extractMicrodata(html);
-  if (microdataFaqs.length) {
-    return createResponse(microdataFaqs, 'microdata', title, url, cors);
-  }
-
-  // 3) Try RDFa
-  const rdfaFaqs = extractRdfa(html);
-  if (rdfaFaqs.length) {
-    return createResponse(rdfaFaqs, 'rdfa', title, url, cors);
-  }
-
-  // Check if markup exists
-  const hasFaqMarkup = html.includes('schema.org/FAQPage') || 
-                       html.includes('typeof="FAQPage"') ||
-                       html.includes('typeof=FAQPage') ||
-                       html.includes('"@type":"FAQPage"');
-  
-  if (hasFaqMarkup) {
-    return new Response(JSON.stringify({
-      success: false,
-      source: url,
-      error: "Page contains FAQ markup but extraction failed. The structure might be non-standard.",
-      metadata: {
-        title: title,
-        extractionMethod: "failed"
-      }
-    }), {
-      headers: { 'Content-Type': 'application/json', ...cors }
-    });
-  }
-
-  // No FAQs found
-  return new Response(JSON.stringify({
-    success: false,
-    source: url,
-    faqs: [],
-    metadata: { 
-      extractionMethod: 'none', 
-      title: title,
-      message: "No FAQ schema markup found on this page"
-    }
-  }), { 
-    headers: { 'Content-Type': 'application/json', ...cors } 
-  });
 }
 
-function createResponse(faqs, method, title, url, cors) {
-  return new Response(JSON.stringify({
-    success: true,
-    source: url,
-    faqs: faqs,
-    metadata: { 
-      extractionMethod: method, 
-      totalExtracted: faqs.length, 
-      title: title 
-    }
-  }), { 
-    headers: { 'Content-Type': 'application/json', ...cors } 
-  });
-}
-
-function extractJsonLd(html) {
+function extractJsonLd(root) {
   const faqs = [];
-  const re = /<script[^>]*type=["']?application\/ld\+json["']?[^>]*>([\s\S]*?)<\/script>/gi;
-  let m;
+  const scripts = root.querySelectorAll('script[type="application/ld+json"]');
   
-  while ((m = re.exec(html))) {
+  scripts.forEach(script => {
     try {
-      const data = JSON.parse(m[1].trim());
+      const data = JSON.parse(script.innerHTML);
       const arr = Array.isArray(data) ? data : [data];
       arr.forEach(d => traverseLd(d, faqs));
     } catch (e) {
       // Skip invalid JSON
     }
-  }
+  });
   
-  return dedupe(faqs);
+  return faqs;
 }
 
 function traverseLd(obj, out) {
@@ -198,137 +319,82 @@ function traverseLd(obj, out) {
   }
 }
 
-function extractMicrodata(html) {
+function extractMicrodata(root) {
   const faqs = [];
   
-  // Pattern for unquoted attributes (like your HTML)
-  const unquotedPattern = /<div\s+itemscope\s+itemprop=mainEntity\s+itemtype="[^"]*Question"[^>]*(?:\s+id=([^\s>]+))?[^>]*>([\s\S]*?)(?=<div\s+itemscope\s+itemprop=mainEntity|$)/gi;
+  // Find all Question itemscopes
+  const questions = root.querySelectorAll('[itemscope][itemtype*="Question"]');
   
-  let match;
-  while ((match = unquotedPattern.exec(html))) {
-    const id = match[1] || null;
-    const content = match[2];
+  questions.forEach(questionEl => {
+    // Get ID
+    const id = questionEl.getAttribute('id') || questionEl.getAttribute('itemid')?.split('#').pop() || null;
     
-    // Extract question - handle unquoted itemprop
-    const qMatch = content.match(/<[^>]+itemprop=name[^>]*>([^<]+)<\/[^>]+>/i);
+    // Get question text
+    const nameEl = questionEl.querySelector('[itemprop="name"]');
+    if (!nameEl) return;
+    const question = nameEl.text.trim();
     
-    // Extract answer - look for text inside acceptedAnswer
+    // Get answer - try multiple approaches
     let answer = '';
-    const acceptedAnswerMatch = content.match(/<div\s+itemscope\s+itemprop=acceptedAnswer[^>]*>([\s\S]*?)<\/div>/i);
-    if (acceptedAnswerMatch) {
-      const answerContent = acceptedAnswerMatch[1];
-      const textMatch = answerContent.match(/<div\s+itemprop=text[^>]*>([\s\S]*?)<\/div>/i);
-      if (textMatch) {
-        answer = textMatch[1].trim();
+    
+    // Approach 1: Direct itemprop="text"
+    const directTextEl = questionEl.querySelector('[itemprop="text"]');
+    if (directTextEl) {
+      answer = directTextEl.innerHTML.trim();
+    } else {
+      // Approach 2: Inside acceptedAnswer
+      const acceptedAnswerEl = questionEl.querySelector('[itemprop="acceptedAnswer"]');
+      if (acceptedAnswerEl) {
+        const textEl = acceptedAnswerEl.querySelector('[itemprop="text"]');
+        if (textEl) {
+          answer = textEl.innerHTML.trim();
+        }
       }
     }
     
-    if (qMatch && answer) {
+    if (question && answer) {
       faqs.push({
-        question: qMatch[1].trim(),
+        question: question,
         answer: answer,
         id: id
       });
     }
-  }
+  });
   
-  // Fallback: Try with flexible attribute matching (both quoted and unquoted)
-  if (faqs.length === 0) {
-    // This pattern handles both quoted and unquoted attributes
-    const flexiblePattern = /<div[^>]*\s+itemscope\s+[^>]*itemprop=["']?mainEntity["']?[^>]*itemtype=["']?[^"'\s]*Question["']?[^>]*>([\s\S]*?)(?=<div[^>]*\s+itemscope\s+[^>]*itemprop=["']?mainEntity["']?|$)/gi;
-    
-    while ((match = flexiblePattern.exec(html))) {
-      const fullMatch = match[0];
-      const content = match[1];
-      
-      // Extract ID
-      let id = null;
-      const idMatch = fullMatch.match(/\s+id=["']?([^"'\s>]+)["']?/i);
-      if (idMatch) {
-        id = idMatch[1];
-      }
-      
-      // Extract question
-      const qMatch = content.match(/<[^>]+itemprop=["']?name["']?[^>]*>([^<]+)<\/[^>]+>/i);
-      
-      // Extract answer
-      let answer = '';
-      const answerMatch = content.match(/<div[^>]+itemprop=["']?text["']?[^>]*>([\s\S]*?)<\/div>/i);
-      if (answerMatch) {
-        answer = answerMatch[1].trim();
-      } else {
-        // Try within acceptedAnswer
-        const acceptedMatch = content.match(/<[^>]+itemprop=["']?acceptedAnswer["']?[^>]*>([\s\S]*?)<\/[^>]+>/i);
-        if (acceptedMatch) {
-          const textMatch = acceptedMatch[1].match(/<[^>]+itemprop=["']?text["']?[^>]*>([\s\S]*?)<\/[^>]+>/i);
-          if (textMatch) {
-            answer = textMatch[1].trim();
-          }
-        }
-      }
-      
-      if (qMatch && answer) {
-        faqs.push({
-          question: qMatch[1].trim(),
-          answer: answer,
-          id: id
-        });
-      }
-    }
-  }
-  
-  return dedupe(faqs);
+  return faqs;
 }
 
-function extractRdfa(html) {
+function extractRdfa(root) {
   const faqs = [];
   
-  // Patterns that handle both quoted and unquoted attributes
-  const patterns = [
-    /<[^>]+typeof=["']?Question["']?[^>]*>([\s\S]*?)(?=<[^>]+typeof=["']?Question["']?|$)/gi,
-    /<[^>]+property=["']?mainEntity["']?[^>]*typeof=["']?Question["']?[^>]*>([\s\S]*?)(?=<[^>]+property=["']?mainEntity["']?|$)/gi
-  ];
+  // Find all Question types
+  const questions = root.querySelectorAll('[typeof="Question"]');
   
-  patterns.forEach(pattern => {
-    let match;
-    pattern.lastIndex = 0;
+  questions.forEach(questionEl => {
+    // Get ID
+    const id = questionEl.getAttribute('id') || 
+               questionEl.getAttribute('resource')?.split('#').pop() || null;
     
-    while ((match = pattern.exec(html))) {
-      const content = match[1];
-      const fullBlock = match[0];
-      
-      // Extract ID
-      let id = null;
-      const idMatch = fullBlock.match(/(?:id|resource)=["']?([^"'\s>]+)["']?/i);
-      if (idMatch) {
-        id = idMatch[1];
-        if (id.includes('#')) {
-          id = id.split('#').pop();
-        }
-      }
-      
-      // Extract question
-      const qMatch = content.match(/<[^>]+property=["']?name["']?[^>]*>([^<]+)<\/[^>]+>/i);
-      
-      // Extract answer
-      const aMatch = content.match(/<[^>]+property=["']?text["']?[^>]*>([\s\S]*?)<\/[^>]+>/i);
-      
-      if (qMatch && aMatch) {
-        faqs.push({
-          question: qMatch[1].trim(),
-          answer: aMatch[1].trim(),
-          id: id
-        });
-      }
+    // Get question text
+    const nameEl = questionEl.querySelector('[property="name"]');
+    if (!nameEl) return;
+    const question = nameEl.text.trim();
+    
+    // Get answer
+    const textEl = questionEl.querySelector('[property="text"]');
+    if (!textEl) return;
+    const answer = textEl.innerHTML.trim();
+    
+    if (question && answer) {
+      faqs.push({
+        question: question,
+        answer: answer,
+        id: id
+      });
     }
   });
   
-  return dedupe(faqs);
-}
-
-function extractTitle(html) {
-  const m = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  return m ? m[1].trim() : '';
+  return faqs;
 }
 
 function dedupe(arr) {
