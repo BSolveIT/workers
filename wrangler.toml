@@ -1,5 +1,10 @@
 name = "faq-proxy"
-type = "modules"                 # ← this is the magic flag!
-compatibility_date = "2025-06-08"  # lock in a date so CF won’t break you
-account_id = "a751b42821042f55c36a770565499abb"   # grab this from your dashboard
+account_id = "a751b42821042f55c36a770565499abb"
 workers_dev = true
+compatibility_date = "2025-06-08"
+
+# For Wrangler v4, use this instead of `type`
+upload_format = "modules"
+
+# Point to your Worker script
+main = "src/index.js"
