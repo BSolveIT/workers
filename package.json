@@ -6,9 +6,6 @@
     "node-html-parser": "^6.1.4",
     "cheerio": "^1.0.0-rc.12"
   },
-  "devDependencies": {
-    "@cloudflare/wrangler": "^2"
-  },
   "scripts": {
     "build": "wrangler build"
   }
