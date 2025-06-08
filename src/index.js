@@ -21,6 +21,7 @@ async function handleRequest(request) {
     return new Response(null, { headers: cors });
   }
 
+  /* COMMENTED OUT ORIGIN CHECKING
   // Security: Origin/Referer checking
   const allowedOrigins = [
     'https://365i.co.uk',
@@ -45,6 +46,7 @@ async function handleRequest(request) {
       headers: { 'Content-Type': 'application/json', ...cors },
     });
   }
+  */
 
   const url = new URL(request.url).searchParams.get('url');
   if (!url) {
@@ -88,11 +90,11 @@ async function handleRequest(request) {
       });
     }
     
-    // Log the extraction request
-    console.log(`FAQ extraction requested: ${url} from ${requestOrigin} at ${new Date().toISOString()}`);
-    
     // Keep origin/referer for logging
     const requestOrigin = origin || referer || 'unknown origin';
+    
+    // Log the extraction request
+    console.log(`FAQ extraction requested: ${url} from ${requestOrigin} at ${new Date().toISOString()}`);
     
     // Add cache buster
     targetUrl.searchParams.append('_cb', Date.now());
