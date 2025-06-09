@@ -1,9 +1,11 @@
 import { parse } from 'node-html-parser';
 
 /**
- * FAQ Schema Extraction Proxy Worker - HTML Parser Version
- * Uses node-html-parser for robust HTML parsing instead of regex
- * Now with IP-based rate limiting via Cloudflare KV
+ * Enhanced FAQ Schema Extraction Proxy Worker
+ * - Handles nested schemas, comments, multiple formats
+ * - Processes images with verification
+ * - Robust HTML sanitization
+ * - Comprehensive metadata and warnings
  */
 addEventListener('fetch', e => e.respondWith(handleRequest(e.request, e)));
 
@@ -250,33 +252,80 @@ async function handleRequest(request, event) {
     
     const title = root.querySelector('title')?.text || '';
     let allFaqs = [];
+    const schemaTypesFound = [];
+    const warnings = [];
+    const processing = {
+      questionsWithHtmlStripped: 0,
+      answersWithHtmlSanitized: 0,
+      truncatedAnswers: 0,
+      imagesProcessed: 0,
+      brokenImages: 0,
+      unverifiedImages: 0,
+      relativeUrlsFixed: 0,
+      dataUrisRejected: 0
+    };
     
-    // 1) Try JSON-LD
+    // 1) Try Enhanced JSON-LD
     try {
-      const jsonLdFaqs = extractJsonLd(root);
-      allFaqs = allFaqs.concat(jsonLdFaqs);
+      const { faqs, metadata } = await extractEnhancedJsonLd(root, targetUrl.href, processing);
+      if (faqs.length > 0) {
+        allFaqs = allFaqs.concat(faqs);
+        schemaTypesFound.push('JSON-LD');
+        if (metadata.warnings) warnings.push(...metadata.warnings);
+      }
     } catch (e) {
-      console.error('JSON-LD extraction failed:', e);
+      console.error('Enhanced JSON-LD extraction failed:', e);
     }
     
-    // 2) Try Microdata
+    // 2) Try Enhanced Microdata
     try {
-      const microdataFaqs = extractMicrodata(root);
-      allFaqs = allFaqs.concat(microdataFaqs);
+      const { faqs, metadata } = await extractEnhancedMicrodata(root, targetUrl.href, processing);
+      if (faqs.length > 0) {
+        allFaqs = allFaqs.concat(faqs);
+        schemaTypesFound.push('Microdata');
+        if (metadata.warnings) warnings.push(...metadata.warnings);
+      }
     } catch (e) {
-      console.error('Microdata extraction failed:', e);
+      console.error('Enhanced Microdata extraction failed:', e);
     }
     
-    // 3) Try RDFa
+    // 3) Try Enhanced RDFa
     try {
-      const rdfaFaqs = extractRdfa(root);
-      allFaqs = allFaqs.concat(rdfaFaqs);
+      const { faqs, metadata } = await extractEnhancedRdfa(root, targetUrl.href, processing);
+      if (faqs.length > 0) {
+        allFaqs = allFaqs.concat(faqs);
+        schemaTypesFound.push('RDFa');
+        if (metadata.warnings) warnings.push(...metadata.warnings);
+      }
     } catch (e) {
-      console.error('RDFa extraction failed:', e);
+      console.error('Enhanced RDFa extraction failed:', e);
     }
     
-    // Deduplicate
-    allFaqs = dedupe(allFaqs);
+    // Deduplicate and limit
+    allFaqs = dedupeEnhanced(allFaqs);
+    
+    // Limit to 50 FAQs
+    if (allFaqs.length > 50) {
+      allFaqs = allFaqs.slice(0, 50);
+      warnings.push('Limited to first 50 FAQs (found ' + allFaqs.length + ')');
+    }
+    
+    // Build warnings from processing stats
+    if (processing.questionsWithHtmlStripped > 0) {
+      warnings.push(`${processing.questionsWithHtmlStripped} questions had HTML markup removed`);
+    }
+    if (processing.truncatedAnswers > 0) {
+      warnings.push(`${processing.truncatedAnswers} answers were truncated to 5000 characters`);
+    }
+    if (processing.brokenImages > 0) {
+      warnings.push(`${processing.brokenImages} images were unreachable`);
+    }
+    if (processing.unverifiedImages > 0) {
+      warnings.push(`${processing.unverifiedImages} images could not be verified`);
+    }
+    if (processing.dataUrisRejected > 0) {
+      warnings.push(`${processing.dataUrisRejected} embedded images were too large`);
+    }
     
     if (allFaqs.length > 0) {
       console.log(`Successfully extracted ${allFaqs.length} FAQs from ${url}`);
@@ -285,9 +334,15 @@ async function handleRequest(request, event) {
         source: url,
         faqs: allFaqs,
         metadata: { 
-          extractionMethod: 'html-parser', 
+          extractionMethod: 'enhanced-html-parser', 
           totalExtracted: allFaqs.length, 
           title: title,
+          processing: processing,
+          warnings: warnings,
+          schemaTypes: schemaTypesFound,
+          hasImages: processing.imagesProcessed > 0,
+          imageCount: processing.imagesProcessed,
+          brokenImages: processing.brokenImages,
           terms: "By using this service, you agree not to violate any website's terms of service."
         }
       }), { 
@@ -309,6 +364,7 @@ async function handleRequest(request, event) {
         metadata: {
           title: title,
           extractionMethod: "failed",
+          warnings: ["FAQ schema detected but could not be parsed"],
           terms: "By using this service, you agree not to violate any website's terms of service."
         }
       }), {
@@ -326,6 +382,7 @@ async function handleRequest(request, event) {
         extractionMethod: 'none', 
         title: title,
         message: "No FAQ schema markup found on this page",
+        warnings: [],
         terms: "By using this service, you agree not to violate any website's terms of service."
       }
     }), { 
@@ -348,149 +405,505 @@ async function handleRequest(request, event) {
   }
 }
 
-function extractJsonLd(root) {
+// Enhanced JSON-LD extraction with preprocessing
+async function extractEnhancedJsonLd(root, baseUrl, processing) {
   const faqs = [];
+  const warnings = [];
   const scripts = root.querySelectorAll('script[type="application/ld+json"]');
   
-  scripts.forEach(script => {
+  for (const script of scripts) {
     try {
-      const data = JSON.parse(script.innerHTML);
+      // Preprocess to handle comments and common issues
+      let content = script.innerHTML
+        .replace(/^\s*\/\/.*$/gm, '')     // Remove // comments
+        .replace(/\/\*[\s\S]*?\*\//g, '') // Remove /* */ comments
+        .replace(/[\u0000-\u001F\u007F-\u009F]/g, '') // Remove control chars
+        .replace(/,\s*([}\]])/g, '$1')    // Remove trailing commas
+        .trim();
+      
+      // Try to parse
+      const data = JSON.parse(content);
       const arr = Array.isArray(data) ? data : [data];
-      arr.forEach(d => traverseLd(d, faqs));
+      
+      for (const obj of arr) {
+        await traverseEnhancedLd(obj, faqs, baseUrl, processing);
+      }
     } catch (e) {
-      // Skip invalid JSON
+      console.warn('Failed to parse JSON-LD:', e.message);
     }
-  });
+  }
   
-  return faqs;
+  return { faqs, metadata: { warnings } };
 }
 
-function traverseLd(obj, out) {
-  if (!obj || typeof obj !== 'object') return;
+// Enhanced traversal for complex JSON-LD structures
+async function traverseEnhancedLd(obj, out, baseUrl, processing, depth = 0) {
+  if (!obj || typeof obj !== 'object' || depth > 5) return;
   
   const type = obj['@type'];
   
-  if ((Array.isArray(type) ? type.includes('FAQPage') : type === 'FAQPage')) {
-    let mainEntity = obj.mainEntity || obj['mainEntity'];
+  // Check if this is or contains FAQPage
+  if ((Array.isArray(type) ? type.includes('FAQPage') : type === 'FAQPage') ||
+      (obj.mainEntity && obj.mainEntity['@type'] === 'FAQPage')) {
+    
+    // Find the FAQ content
+    let faqContent = obj;
+    if (obj.mainEntity && obj.mainEntity['@type'] === 'FAQPage') {
+      faqContent = obj.mainEntity;
+    }
+    
+    let mainEntity = faqContent.mainEntity || faqContent['mainEntity'] || faqContent.hasPart;
     if (mainEntity) {
       mainEntity = Array.isArray(mainEntity) ? mainEntity : [mainEntity];
-      mainEntity.forEach(q => {
-        if (q['@type'] === 'Question' && q.name) {
-          let answer = '';
-          if (q.acceptedAnswer) {
-            answer = typeof q.acceptedAnswer === 'string'
-              ? q.acceptedAnswer
-              : (q.acceptedAnswer.text || '');
-          }
-          if (answer) {
-            let id = q['@id'] || q.id || null;
-            if (id && id.includes('#')) {
-              id = id.split('#').pop();
-            }
-            out.push({ 
-              question: q.name.trim(), 
-              answer: answer.trim(), 
-              id: id 
-            });
-          }
+      
+      for (const q of mainEntity) {
+        if (!q['@type'] || !q['@type'].includes('Question')) continue;
+        
+        // Process question
+        const rawQuestion = q.name || q.question || '';
+        const processedQuestion = processQuestion(rawQuestion, processing);
+        if (!processedQuestion) continue;
+        
+        // Extract answer - try multiple properties
+        let rawAnswer = '';
+        const accepted = q.acceptedAnswer;
+        const suggested = q.suggestedAnswer;
+        
+        if (accepted) {
+          rawAnswer = typeof accepted === 'string' ? accepted : 
+                     (accepted.text || accepted.answerText || accepted.description || '');
+        } else if (suggested && suggested.length > 0) {
+          const firstSuggested = suggested[0];
+          rawAnswer = typeof firstSuggested === 'string' ? firstSuggested :
+                     (firstSuggested.text || firstSuggested.answerText || '');
         }
-      });
+        
+        if (!rawAnswer) continue;
+        
+        // Process answer with full sanitization and image handling
+        const processedAnswer = await processAnswer(rawAnswer, baseUrl, processing);
+        
+        // Extract ID/anchor
+        let id = q['@id'] || q.id || q.url || null;
+        if (id && id.includes('#')) {
+          id = id.split('#').pop();
+        }
+        if (id) {
+          id = sanitizeAnchor(id);
+        }
+        
+        out.push({ 
+          question: processedQuestion,
+          answer: processedAnswer,
+          id: id
+        });
+      }
     }
   }
   
-  if (Array.isArray(obj['@graph'])) {
-    obj['@graph'].forEach(x => traverseLd(x, out));
+  // Traverse nested structures
+  if (obj['@graph'] && Array.isArray(obj['@graph'])) {
+    for (const item of obj['@graph']) {
+      await traverseEnhancedLd(item, out, baseUrl, processing, depth + 1);
+    }
+  }
+  
+  // Check for nested WebPage > mainEntity patterns
+  if (obj.mainEntity && depth < 3) {
+    await traverseEnhancedLd(obj.mainEntity, out, baseUrl, processing, depth + 1);
   }
 }
 
-function extractMicrodata(root) {
+// Enhanced Microdata extraction
+async function extractEnhancedMicrodata(root, baseUrl, processing) {
   const faqs = [];
+  const warnings = [];
   
-  // Find all Question itemscopes
-  const questions = root.querySelectorAll('[itemscope][itemtype*="Question"]');
+  // First try FAQPage containers
+  const faqPages = root.querySelectorAll('[itemscope][itemtype*="FAQPage"]');
+  for (const faqPage of faqPages) {
+    const questions = faqPage.querySelectorAll('[itemscope][itemtype*="Question"]');
+    for (const q of questions) {
+      await processMicrodataQuestion(q, faqs, baseUrl, processing);
+    }
+  }
   
-  questions.forEach(questionEl => {
-    // Get ID
-    const id = questionEl.getAttribute('id') || questionEl.getAttribute('itemid')?.split('#').pop() || null;
+  // Also try standalone Questions
+  const standaloneQuestions = root.querySelectorAll('[itemscope][itemtype*="Question"]:not([itemtype*="FAQPage"] [itemscope][itemtype*="Question"])');
+  for (const q of standaloneQuestions) {
+    await processMicrodataQuestion(q, faqs, baseUrl, processing);
+  }
+  
+  return { faqs, metadata: { warnings } };
+}
+
+async function processMicrodataQuestion(questionEl, faqs, baseUrl, processing) {
+  // Get ID
+  const id = sanitizeAnchor(
+    questionEl.getAttribute('id') || 
+    questionEl.getAttribute('itemid')?.split('#').pop() || 
+    null
+  );
+  
+  // Get question text - try multiple selectors
+  let rawQuestion = '';
+  const nameEl = questionEl.querySelector('[itemprop="name"]');
+  if (nameEl) {
+    rawQuestion = nameEl.textContent || nameEl.getAttribute('content') || '';
+  }
+  
+  const processedQuestion = processQuestion(rawQuestion, processing);
+  if (!processedQuestion) return;
+  
+  // Get answer - try multiple approaches
+  let rawAnswer = '';
+  
+  // Direct text property
+  const directTextEl = questionEl.querySelector('[itemprop="text"]');
+  if (directTextEl) {
+    rawAnswer = directTextEl.innerHTML;
+  } else {
+    // Inside acceptedAnswer
+    const acceptedAnswerEl = questionEl.querySelector('[itemprop="acceptedAnswer"]');
+    if (acceptedAnswerEl) {
+      const textEl = acceptedAnswerEl.querySelector('[itemprop="text"]');
+      if (textEl) {
+        rawAnswer = textEl.innerHTML;
+      } else {
+        // Sometimes the acceptedAnswer itself contains the text
+        rawAnswer = acceptedAnswerEl.innerHTML;
+      }
+    }
+  }
+  
+  if (!rawAnswer) {
+    // Try suggestedAnswer as fallback
+    const suggestedEl = questionEl.querySelector('[itemprop="suggestedAnswer"] [itemprop="text"]');
+    if (suggestedEl) {
+      rawAnswer = suggestedEl.innerHTML;
+    }
+  }
+  
+  if (!rawAnswer) return;
+  
+  const processedAnswer = await processAnswer(rawAnswer, baseUrl, processing);
+  
+  faqs.push({
+    question: processedQuestion,
+    answer: processedAnswer,
+    id: id
+  });
+}
+
+// Enhanced RDFa extraction
+async function extractEnhancedRdfa(root, baseUrl, processing) {
+  const faqs = [];
+  const warnings = [];
+  
+  // Try FAQPage containers first
+  const faqPages = root.querySelectorAll('[typeof*="FAQPage"], [typeof*="https://schema.org/FAQPage"]');
+  for (const faqPage of faqPages) {
+    const questions = faqPage.querySelectorAll('[typeof*="Question"]');
+    for (const q of questions) {
+      await processRdfaQuestion(q, faqs, baseUrl, processing);
+    }
+  }
+  
+  // Also try standalone Questions
+  const standaloneQuestions = root.querySelectorAll('[typeof*="Question"]:not([typeof*="FAQPage"] [typeof*="Question"])');
+  for (const q of standaloneQuestions) {
+    await processRdfaQuestion(q, faqs, baseUrl, processing);
+  }
+  
+  return { faqs, metadata: { warnings } };
+}
+
+async function processRdfaQuestion(questionEl, faqs, baseUrl, processing) {
+  // Get ID
+  const id = sanitizeAnchor(
+    questionEl.getAttribute('id') || 
+    questionEl.getAttribute('resource')?.split('#').pop() ||
+    questionEl.getAttribute('about')?.split('#').pop() ||
+    null
+  );
+  
+  // Get question text
+  const nameEl = questionEl.querySelector('[property="name"], [property="schema:name"]');
+  if (!nameEl) return;
+  const rawQuestion = nameEl.textContent || nameEl.getAttribute('content') || '';
+  
+  const processedQuestion = processQuestion(rawQuestion, processing);
+  if (!processedQuestion) return;
+  
+  // Get answer - try multiple selectors
+  let rawAnswer = '';
+  const textEl = questionEl.querySelector('[property="text"], [property="schema:text"], [property="acceptedAnswer"] [property="text"]');
+  if (textEl) {
+    rawAnswer = textEl.innerHTML;
+  }
+  
+  if (!rawAnswer) return;
+  
+  const processedAnswer = await processAnswer(rawAnswer, baseUrl, processing);
+  
+  faqs.push({
+    question: processedQuestion,
+    answer: processedAnswer,
+    id: id
+  });
+}
+
+// Process question text
+function processQuestion(raw, processing) {
+  if (!raw) return '';
+  
+  // Decode HTML entities
+  raw = decodeHtmlEntities(raw);
+  
+  // Check if contains HTML
+  if (/<[^>]+>/.test(raw)) {
+    processing.questionsWithHtmlStripped++;
+  }
+  
+  // Strip all HTML tags
+  raw = raw.replace(/<[^>]+>/g, '');
+  
+  // Normalize whitespace
+  raw = raw.replace(/\s+/g, ' ').trim();
+  
+  // Limit length
+  if (raw.length > 300) {
+    // Try to cut at word boundary
+    raw = raw.substring(0, 300);
+    const lastSpace = raw.lastIndexOf(' ');
+    if (lastSpace > 250) {
+      raw = raw.substring(0, lastSpace) + '...';
+    }
+  }
+  
+  return raw;
+}
+
+// Process answer with sanitization and image handling
+async function processAnswer(raw, baseUrl, processing) {
+  if (!raw) return '';
+  
+  processing.answersWithHtmlSanitized++;
+  
+  // First decode entities
+  raw = decodeHtmlEntities(raw);
+  
+  // Create temporary DOM for processing
+  const tempDiv = document.createElement('div');
+  tempDiv.innerHTML = raw;
+  
+  // Remove dangerous elements
+  const dangerousTags = ['script', 'style', 'iframe', 'object', 'embed', 'form', 'input', 'button'];
+  dangerousTags.forEach(tag => {
+    const elements = tempDiv.querySelectorAll(tag);
+    elements.forEach(el => el.remove());
+  });
+  
+  // Remove event handlers
+  const allElements = tempDiv.querySelectorAll('*');
+  allElements.forEach(el => {
+    // Remove all attributes starting with 'on'
+    Array.from(el.attributes).forEach(attr => {
+      if (attr.name.startsWith('on') || attr.value.includes('javascript:')) {
+        el.removeAttribute(attr.name);
+      }
+    });
+  });
+  
+  // Process links - make relative URLs absolute
+  const links = tempDiv.querySelectorAll('a');
+  let relativeUrlsFixed = 0;
+  links.forEach(link => {
+    const href = link.getAttribute('href');
+    if (href && !href.startsWith('http') && !href.startsWith('#') && !href.startsWith('mailto:')) {
+      try {
+        const absolute = new URL(href, baseUrl).href;
+        link.setAttribute('href', absolute);
+        relativeUrlsFixed++;
+      } catch (e) {
+        // Invalid URL, remove href
+        link.removeAttribute('href');
+      }
+    }
+  });
+  processing.relativeUrlsFixed += relativeUrlsFixed;
+  
+  // Process images
+  const images = tempDiv.querySelectorAll('img');
+  processing.imagesProcessed += images.length;
+  
+  // Process up to 10 images with verification
+  let imageCheckCount = 0;
+  for (const img of images) {
+    let src = img.getAttribute('src');
     
-    // Get question text
-    const nameEl = questionEl.querySelector('[itemprop="name"]');
-    if (!nameEl) return;
-    const question = nameEl.text.trim();
+    if (!src) {
+      img.remove();
+      continue;
+    }
     
-    // Get answer - try multiple approaches
-    let answer = '';
+    // Handle data URIs
+    if (src.startsWith('data:')) {
+      if (src.length > 100000) { // 100KB limit
+        img.setAttribute('src', '#');
+        img.setAttribute('alt', img.getAttribute('alt') || 'Image too large to display');
+        img.setAttribute('data-error', 'embedded-image-too-large');
+        processing.dataUrisRejected++;
+        processing.brokenImages++;
+      }
+      continue;
+    }
     
-    // Approach 1: Direct itemprop="text"
-    const directTextEl = questionEl.querySelector('[itemprop="text"]');
-    if (directTextEl) {
-      answer = directTextEl.innerHTML.trim();
-    } else {
-      // Approach 2: Inside acceptedAnswer
-      const acceptedAnswerEl = questionEl.querySelector('[itemprop="acceptedAnswer"]');
-      if (acceptedAnswerEl) {
-        const textEl = acceptedAnswerEl.querySelector('[itemprop="text"]');
-        if (textEl) {
-          answer = textEl.innerHTML.trim();
+    // Fix relative URLs
+    if (!src.startsWith('http')) {
+      try {
+        // Handle protocol-relative URLs
+        if (src.startsWith('//')) {
+          src = 'https:' + src;
+        } else {
+          src = new URL(src, baseUrl).href;
         }
+        img.setAttribute('src', src);
+        processing.relativeUrlsFixed++;
+      } catch (e) {
+        img.setAttribute('data-broken', 'true');
+        img.setAttribute('alt', img.getAttribute('alt') || 'Image unavailable');
+        processing.brokenImages++;
+        continue;
       }
     }
     
-    if (question && answer) {
-      faqs.push({
-        question: question,
-        answer: answer,
-        id: id
-      });
+    // Add lazy loading
+    img.setAttribute('loading', 'lazy');
+    
+    // Add alt text if missing
+    if (!img.getAttribute('alt')) {
+      img.setAttribute('alt', 'FAQ image');
+    }
+    
+    // Verify image availability (limit to 10 checks)
+    if (imageCheckCount < 10) {
+      imageCheckCount++;
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 2000); // 2 second timeout
+        
+        const response = await fetch(src, {
+          method: 'HEAD',
+          signal: controller.signal,
+          // Note: no-cors mode means we can't read response, but that's OK
+          mode: 'no-cors'
+        });
+        
+        clearTimeout(timeoutId);
+        
+        // With no-cors, we can't actually check if it's OK, so mark as unverified
+        img.setAttribute('data-verified', 'unverified');
+        processing.unverifiedImages++;
+        
+      } catch (e) {
+        // Timeout or network error
+        if (e.name === 'AbortError') {
+          img.setAttribute('data-verified', 'timeout');
+          processing.unverifiedImages++;
+        } else {
+          img.setAttribute('data-broken', 'true');
+          img.setAttribute('alt', img.getAttribute('alt') || 'Image unavailable');
+          processing.brokenImages++;
+        }
+      }
+    } else {
+      // Skip verification for remaining images
+      img.setAttribute('data-verified', 'skipped');
+    }
+  }
+  
+  // Clean up empty paragraphs and normalize
+  const paragraphs = tempDiv.querySelectorAll('p');
+  paragraphs.forEach(p => {
+    if (!p.textContent.trim() && !p.querySelector('img')) {
+      p.remove();
     }
   });
   
-  return faqs;
+  // Get cleaned HTML
+  let cleaned = tempDiv.innerHTML;
+  
+  // Final length check
+  if (cleaned.length > 5000) {
+    cleaned = cleaned.substring(0, 5000);
+    // Try to close any open tags
+    cleaned = cleaned.replace(/<[^>]*$/, '') + '... (truncated)';
+    processing.truncatedAnswers++;
+  }
+  
+  return cleaned;
 }
 
-function extractRdfa(root) {
-  const faqs = [];
+// Sanitize anchor/ID
+function sanitizeAnchor(id) {
+  if (!id) return null;
   
-  // Find all Question types
-  const questions = root.querySelectorAll('[typeof="Question"]');
-  
-  questions.forEach(questionEl => {
-    // Get ID
-    const id = questionEl.getAttribute('id') || 
-               questionEl.getAttribute('resource')?.split('#').pop() || null;
-    
-    // Get question text
-    const nameEl = questionEl.querySelector('[property="name"]');
-    if (!nameEl) return;
-    const question = nameEl.text.trim();
-    
-    // Get answer
-    const textEl = questionEl.querySelector('[property="text"]');
-    if (!textEl) return;
-    const answer = textEl.innerHTML.trim();
-    
-    if (question && answer) {
-      faqs.push({
-        question: question,
-        answer: answer,
-        id: id
-      });
-    }
-  });
-  
-  return faqs;
+  // Remove any dangerous characters
+  return id
+    .replace(/[^a-zA-Z0-9_-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .substring(0, 100);
 }
 
-function dedupe(arr) {
-  const seen = new Set();
-  return arr.filter(faq => {
+// Decode HTML entities
+function decodeHtmlEntities(text) {
+  const entities = {
+    '&amp;': '&',
+    '&lt;': '<',
+    '&gt;': '>',
+    '&quot;': '"',
+    '&#39;': "'",
+    '&nbsp;': ' ',
+    '&mdash;': '—',
+    '&ndash;': '–',
+    '&hellip;': '…',
+    '&copy;': '©',
+    '&reg;': '®',
+    '&trade;': '™'
+  };
+  
+  return text.replace(/&[#a-zA-Z0-9]+;/g, (match) => entities[match] || match);
+}
+
+// Enhanced deduplication
+function dedupeEnhanced(arr) {
+  const seen = new Map();
+  const MAX_FAQS = 50;
+  
+  return arr.filter((faq, index) => {
+    if (index >= MAX_FAQS) return false;
+    
     if (!faq.question || !faq.answer) return false;
     if (faq.question.includes('${') || faq.answer.includes('${')) return false;
     
-    const key = faq.question.toLowerCase().trim();
-    if (seen.has(key)) return false;
+    // Create normalized key for comparison
+    const key = faq.question.toLowerCase()
+      .replace(/[^\w\s]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
     
-    seen.add(key);
+    if (seen.has(key)) {
+      // Keep the one with an ID if duplicate
+      const existing = seen.get(key);
+      if (!existing.id && faq.id) {
+        seen.set(key, faq);
+      }
+      return false;
+    }
+    
+    seen.set(key, faq);
     return true;
   });
 }
