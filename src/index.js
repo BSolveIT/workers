@@ -31,7 +31,8 @@ async function handleRequest(request, event) {
     'https://www.365i.co.uk',
     'https://staging.365i.co.uk',
     'http://localhost:3000',
-    'http://localhost:8080'
+    'http://localhost:8080',
+    'https://faq-proxy.winter-cake-bf57.workers.dev' // Allow dev tools
   ];
   
   // More flexible origin checking
