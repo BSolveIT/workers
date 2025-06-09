@@ -408,24 +408,50 @@ async function extractEnhancedJsonLd(root, baseUrl, processing) {
   
   for (const script of scripts) {
     try {
-      // Preprocess to handle comments and common issues
-      let content = script.innerHTML
-        .replace(/^[\s]*\/\/.*$/gm, '')   // More specific: only at line start
-        .replace(/\/\*[\s\S]*?\*\//g, '') // Remove /* */ comments
-        .replace(/[\u0000-\u001F\u007F-\u009F]/g, '') // Remove control chars
-        .replace(/,\s*([}\]])/g, '$1')    // Remove trailing commas
-        .trim();
+      let content = script.innerHTML.trim();
+      let data;
       
-      // Try to parse
-      const data = JSON.parse(content);
+      // First, try to parse without any preprocessing (for valid escaped JSON)
+      try {
+        data = JSON.parse(content);
+      } catch (initialError) {
+        // Only preprocess if the initial parse fails
+        console.log('Initial JSON parse failed, applying preprocessing...');
+        
+        // Preprocess to handle comments and common issues
+        content = content
+          // Only match // at the very beginning of a line (not escaped \/)
+          .replace(/^(\s*)\/\/(?!\/).*$/gm, '')
+          // Remove /* */ comments
+          .replace(/\/\*[\s\S]*?\*\//g, '')
+          // Remove control characters (but preserve valid Unicode like \u2019)
+          .replace(/[\u0000-\u001F\u007F-\u009F]/g, '')
+          // Remove trailing commas
+          .replace(/,(\s*[}\]])/g, '$1')
+          // Remove any BOM characters
+          .replace(/^\uFEFF/, '')
+          .trim();
+        
+        // Try parsing again after preprocessing
+        try {
+          data = JSON.parse(content);
+        } catch (preprocessError) {
+          console.warn('Failed to parse JSON-LD even after preprocessing:', preprocessError.message);
+          console.warn('Content sample:', content.substring(0, 200) + '...');
+          continue; // Skip this script
+        }
+      }
+      
+      // Process the parsed data
       const arr = Array.isArray(data) ? data : [data];
       
       for (const obj of arr) {
-        // Use Promise.resolve to handle async properly
-        await Promise.resolve(traverseEnhancedLd(obj, faqs, baseUrl, processing));
+        await traverseEnhancedLd(obj, faqs, baseUrl, processing);
       }
+      
     } catch (e) {
-      console.warn('Failed to parse JSON-LD:', e.message);
+      console.error('Unexpected error in JSON-LD extraction:', e.message);
+      warnings.push(`Failed to process JSON-LD: ${e.message}`);
     }
   }
   
