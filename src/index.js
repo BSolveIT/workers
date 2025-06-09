@@ -21,32 +21,48 @@ async function handleRequest(request) {
     return new Response(null, { headers: cors });
   }
 
-  /* COMMENTED OUT ORIGIN CHECKING
-  // Security: Origin/Referer checking
+  // Security: Origin/Referer checking - FIXED VERSION
   const allowedOrigins = [
     'https://365i.co.uk',
     'https://www.365i.co.uk',
     'https://staging.365i.co.uk',
-    'http://localhost:3000', // For local development
-    'http://localhost:8080'  // For local development
+    'http://localhost:3000',
+    'http://localhost:8080'
   ];
   
-  // Check if request comes from allowed origins (if origin header exists)
-  if (origin && !allowedOrigins.some(allowed => origin.startsWith(allowed))) {
-    console.log(`Blocked request from unauthorized origin: ${origin}`);
-    return new Response(JSON.stringify({ 
-      error: 'Unauthorized origin', 
-      success: false,
-      metadata: {
-        warning: "This service is for FAQ extraction only. Abuse will result in blocking.",
-        terms: "By using this service, you agree not to violate any website's terms of service."
-      }
-    }), {
-      status: 403,
-      headers: { 'Content-Type': 'application/json', ...cors },
+  // More flexible origin checking
+  if (origin || referer) {
+    const checkOrigin = origin || referer;
+    const isAllowed = allowedOrigins.some(allowed => {
+      // Check if the origin/referer starts with allowed origin
+      return checkOrigin.startsWith(allowed) ||
+        // Also check without www
+        checkOrigin.startsWith(allowed.replace('www.', '')) ||
+        // And with www if not present
+        checkOrigin.startsWith(allowed.replace('://', '://www.'));
     });
+    
+    if (!isAllowed) {
+      console.log(`Request from origin: ${origin}, referer: ${referer}`);
+      console.log(`Blocked request from unauthorized origin: ${checkOrigin}`);
+      return new Response(JSON.stringify({
+        error: 'Unauthorized origin',
+        success: false,
+        debug: {
+          origin: origin,
+          referer: referer,
+          checkedAgainst: checkOrigin
+        },
+        metadata: {
+          warning: "This service is for FAQ extraction only. Abuse will result in blocking.",
+          terms: "By using this service, you agree not to violate any website's terms of service."
+        }
+      }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json', ...cors },
+      });
+    }
   }
-  */
 
   const url = new URL(request.url).searchParams.get('url');
   if (!url) {
