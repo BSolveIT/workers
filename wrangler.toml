@@ -3,3 +3,8 @@ account_id         = "a751b42821042f55c36a770565499abb"
 main               = "src/index.js"         # ← points to your Worker code
 compatibility_date = "2025-06-08"
 workers_dev        = true
+
+[[kv_namespaces]]
+binding = "FAQ_RATE_LIMITS"
+id = "77fcd59503e34efcaf4d77d1a550433b"
+preview_id = "77fcd59503e34efcaf4d77d1a550433b"
