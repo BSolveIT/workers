@@ -25,6 +25,7 @@ async function handleRequest(request, event) {
     return new Response(null, { headers: cors });
   }
 
+
   // Security: Origin/Referer checking
   const allowedOrigins = [
     'https://365i.co.uk',
@@ -32,7 +33,7 @@ async function handleRequest(request, event) {
     'https://staging.365i.co.uk',
     'http://localhost:3000',
     'http://localhost:8080',
-    'https://faq-proxy.winter-cake-bf57.workers.dev' // Allow dev tools
+    'https://dash.cloudflare.com' // Allow testing from Cloudflare dashboard
   ];
   
   // More flexible origin checking
