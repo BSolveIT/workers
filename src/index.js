@@ -237,12 +237,12 @@ async function handleRequest(request, event) {
       });
     }
     
-    // Parse HTML
+    // Parse HTML - FIXED: Set script: true to enable script content parsing
     const root = parse(html, {
       lowerCaseTagName: false,
       comment: false,
       blockTextElements: {
-        script: false,
+        script: true,  // CHANGED FROM false TO true - This enables script content parsing!
         noscript: false,
         style: false,
       }
@@ -416,7 +416,7 @@ async function handleRequest(request, event) {
   }
 }
 
-// Enhanced JSON-LD extraction with preprocessing
+// Enhanced JSON-LD extraction with preprocessing - FIXED to use correct properties
 async function extractEnhancedJsonLd(root, baseUrl, processing) {
   const faqs = [];
   const warnings = [];
@@ -429,19 +429,17 @@ async function extractEnhancedJsonLd(root, baseUrl, processing) {
     console.log(`[JSON-LD] Processing script ${scriptIndex + 1}/${scripts.length}`);
     
     try {
-      // For node-html-parser, try multiple properties to get content
-      let content = script.innerHTML || script.innerText || script.rawText || script.text || '';
-      
-      // If still empty, try getting the text content directly
-      if (!content.trim() && script.childNodes && script.childNodes.length > 0) {
-        content = script.childNodes[0].rawText || script.childNodes[0].text || '';
-      }
+      // FIXED: Use the correct properties based on node-html-parser documentation
+      // textContent is preferred, innerHTML also works, rawText is the raw version
+      // Do NOT use .text as it returns outerHTML!
+      let content = script.textContent || script.innerHTML || script.rawText || '';
       
       content = content.trim();
       console.log(`[JSON-LD] Script content length: ${content.length} characters`);
-      console.log(`[JSON-LD] First 200 chars: ${content.substring(0, 200)}...`);
       
-      if (!content) {
+      if (content.length > 0) {
+        console.log(`[JSON-LD] First 200 chars: ${content.substring(0, 200)}...`);
+      } else {
         console.log('[JSON-LD] Script has no content, skipping');
         continue;
       }
@@ -665,12 +663,12 @@ async function processMicrodataQuestion(questionEl, faqs, baseUrl, processing) {
   );
   console.log(`[Microdata] Question ID: ${id || 'none'}`);
   
-  // Get question text - try multiple selectors
+  // Get question text - FIXED to use textContent instead of .text
   let rawQuestion = '';
   const nameEl = questionEl.querySelector('[itemprop="name"]');
   if (nameEl) {
-    // Use .text for node-html-parser, not .textContent
-    rawQuestion = nameEl.text || nameEl.getAttribute('content') || '';
+    // Use textContent or innerText, NOT .text (which returns outerHTML)
+    rawQuestion = nameEl.textContent || nameEl.innerText || nameEl.getAttribute('content') || '';
     console.log(`[Microdata] Found question name: "${rawQuestion}"`);
   }
   
@@ -776,15 +774,15 @@ async function processRdfaQuestion(questionEl, faqs, baseUrl, processing) {
   );
   console.log(`[RDFa] Question ID: ${id || 'none'}`);
   
-  // Get question text
+  // Get question text - FIXED to use textContent instead of .text
   const nameEl = questionEl.querySelector('[property="name"], [property="schema:name"]');
   if (!nameEl) {
     console.log('[RDFa] No name element found');
     return;
   }
   
-  // Use .text for node-html-parser
-  const rawQuestion = nameEl.text || nameEl.getAttribute('content') || '';
+  // Use textContent or innerText, NOT .text (which returns outerHTML)
+  const rawQuestion = nameEl.textContent || nameEl.innerText || nameEl.getAttribute('content') || '';
   console.log(`[RDFa] Found question: "${rawQuestion}"`);
   
   const processedQuestion = processQuestion(rawQuestion, processing);
