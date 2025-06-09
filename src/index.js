@@ -1,7 +1,7 @@
 import { parse } from 'node-html-parser';
 
 /**
- * Enhanced FAQ Schema Extraction Proxy Worker
+ * Enhanced FAQ Schema Extraction Proxy Worker (Fixed)
  * - Handles nested schemas, comments, multiple formats
  * - Processes images with verification
  * - Robust HTML sanitization
@@ -24,7 +24,7 @@ async function handleRequest(request, event) {
     return new Response(null, { headers: cors });
   }
 
-  // Security: Origin/Referer checking - FIXED VERSION
+  // Security: Origin/Referer checking
   const allowedOrigins = [
     'https://365i.co.uk',
     'https://www.365i.co.uk',
@@ -37,11 +37,8 @@ async function handleRequest(request, event) {
   if (origin || referer) {
     const checkOrigin = origin || referer;
     const isAllowed = allowedOrigins.some(allowed => {
-      // Check if the origin/referer starts with allowed origin
       return checkOrigin.startsWith(allowed) ||
-        // Also check without www
         checkOrigin.startsWith(allowed.replace('www.', '')) ||
-        // And with www if not present
         checkOrigin.startsWith(allowed.replace('://', '://www.'));
     });
     
@@ -68,65 +65,66 @@ async function handleRequest(request, event) {
   }
 
   // RATE LIMITING - Check before processing request
-  const DAILY_LIMIT = 100; // Adjust this as needed
+  const DAILY_LIMIT = 100;
   const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
   const today = new Date().toISOString().split('T')[0];
   const rateLimitKey = `faq-proxy:${clientIP}:${today}`;
   
   try {
-    // Get current usage from KV
-    let usageData = await event.env.FAQ_RATE_LIMITS.get(rateLimitKey, { type: 'json' });
-    if (!usageData) {
-      usageData = { count: 0, date: today };
-    }
-    
-    // Check if rate limit exceeded
-    if (usageData.count >= DAILY_LIMIT) {
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      tomorrow.setHours(0, 0, 0, 0);
+    // Only proceed with rate limiting if KV namespace is available
+    if (event.env && event.env.FAQ_RATE_LIMITS) {
+      let usageData = await event.env.FAQ_RATE_LIMITS.get(rateLimitKey, { type: 'json' });
+      if (!usageData) {
+        usageData = { count: 0, date: today };
+      }
       
-      console.log(`Rate limit exceeded for IP ${clientIP}: ${usageData.count}/${DAILY_LIMIT}`);
+      // Check if rate limit exceeded
+      if (usageData.count >= DAILY_LIMIT) {
+        const tomorrow = new Date();
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        tomorrow.setHours(0, 0, 0, 0);
+        
+        console.log(`Rate limit exceeded for IP ${clientIP}: ${usageData.count}/${DAILY_LIMIT}`);
+        
+        return new Response(JSON.stringify({
+          rateLimited: true,
+          error: `Daily extraction limit reached. You can extract up to ${DAILY_LIMIT} pages per day.`,
+          resetTime: tomorrow.getTime(),
+          limit: DAILY_LIMIT,
+          used: usageData.count,
+          resetIn: Math.ceil((tomorrow.getTime() - Date.now()) / 1000 / 60),
+          success: false,
+          metadata: {
+            warning: "Rate limit exceeded. Please try again tomorrow.",
+            terms: "By using this service, you agree not to violate any website's terms of service."
+          }
+        }), {
+          status: 429,
+          headers: { 
+            'Content-Type': 'application/json',
+            'X-RateLimit-Limit': DAILY_LIMIT.toString(),
+            'X-RateLimit-Remaining': '0',
+            'X-RateLimit-Reset': tomorrow.getTime().toString(),
+            ...cors 
+          },
+        });
+      }
       
-      return new Response(JSON.stringify({
-        rateLimited: true,
-        error: `Daily extraction limit reached. You can extract up to ${DAILY_LIMIT} pages per day.`,
-        resetTime: tomorrow.getTime(),
-        limit: DAILY_LIMIT,
-        used: usageData.count,
-        resetIn: Math.ceil((tomorrow.getTime() - Date.now()) / 1000 / 60), // minutes until reset
-        success: false,
-        metadata: {
-          warning: "Rate limit exceeded. Please try again tomorrow.",
-          terms: "By using this service, you agree not to violate any website's terms of service."
-        }
-      }), {
-        status: 429,
-        headers: { 
-          'Content-Type': 'application/json',
-          'X-RateLimit-Limit': DAILY_LIMIT.toString(),
-          'X-RateLimit-Remaining': '0',
-          'X-RateLimit-Reset': tomorrow.getTime().toString(),
-          ...cors 
-        },
-      });
+      // Increment usage counter
+      usageData.count++;
+      
+      // Store updated usage after request completes
+      event.waitUntil(
+        event.env.FAQ_RATE_LIMITS.put(rateLimitKey, JSON.stringify(usageData), {
+          expirationTtl: 86400 // 24 hours
+        })
+      );
+      
+      // Add rate limit headers to response
+      const remaining = DAILY_LIMIT - usageData.count;
+      cors['X-RateLimit-Limit'] = DAILY_LIMIT.toString();
+      cors['X-RateLimit-Remaining'] = Math.max(0, remaining).toString();
     }
-    
-    // Increment usage counter (will be saved after successful extraction)
-    usageData.count++;
-    
-    // Store updated usage after request completes
-    event.waitUntil(
-      event.env.FAQ_RATE_LIMITS.put(rateLimitKey, JSON.stringify(usageData), {
-        expirationTtl: 86400 // 24 hours
-      })
-    );
-    
-    // Add rate limit headers to response
-    const remaining = DAILY_LIMIT - usageData.count;
-    cors['X-RateLimit-Limit'] = DAILY_LIMIT.toString();
-    cors['X-RateLimit-Remaining'] = Math.max(0, remaining).toString();
-    
   } catch (kvError) {
     console.error('KV rate limit error:', kvError);
     // Continue without rate limiting if KV fails
@@ -174,10 +172,7 @@ async function handleRequest(request, event) {
       });
     }
     
-    // Keep origin/referer for logging
     const requestOrigin = origin || referer || 'unknown origin';
-    
-    // Log the extraction request
     console.log(`FAQ extraction requested: ${url} from ${requestOrigin} at ${new Date().toISOString()}`);
     
     // Add cache buster
@@ -185,7 +180,7 @@ async function handleRequest(request, event) {
     
     // Fetch with timeout
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
     
     const resp = await fetch(targetUrl.toString(), {
       signal: controller.signal,
@@ -426,7 +421,8 @@ async function extractEnhancedJsonLd(root, baseUrl, processing) {
       const arr = Array.isArray(data) ? data : [data];
       
       for (const obj of arr) {
-        await traverseEnhancedLd(obj, faqs, baseUrl, processing);
+        // Use Promise.resolve to handle async properly
+        await Promise.resolve(traverseEnhancedLd(obj, faqs, baseUrl, processing));
       }
     } catch (e) {
       console.warn('Failed to parse JSON-LD:', e.message);
@@ -480,7 +476,7 @@ async function traverseEnhancedLd(obj, out, baseUrl, processing, depth = 0) {
         
         if (!rawAnswer) continue;
         
-        // Process answer with full sanitization and image handling
+        // Process answer with sanitization and image handling
         const processedAnswer = await processAnswer(rawAnswer, baseUrl, processing);
         
         // Extract ID/anchor
@@ -528,10 +524,15 @@ async function extractEnhancedMicrodata(root, baseUrl, processing) {
     }
   }
   
-  // Also try standalone Questions
-  const standaloneQuestions = root.querySelectorAll('[itemscope][itemtype*="Question"]:not([itemtype*="FAQPage"] [itemscope][itemtype*="Question"])');
-  for (const q of standaloneQuestions) {
-    await processMicrodataQuestion(q, faqs, baseUrl, processing);
+  // Also try standalone Questions (but simpler approach)
+  const allQuestions = root.querySelectorAll('[itemscope][itemtype*="Question"]');
+  const processedIds = new Set(faqs.map(f => f.id).filter(Boolean));
+  
+  for (const q of allQuestions) {
+    const id = q.getAttribute('id') || q.getAttribute('itemid')?.split('#').pop();
+    if (!processedIds.has(id)) {
+      await processMicrodataQuestion(q, faqs, baseUrl, processing);
+    }
   }
   
   return { faqs, metadata: { warnings } };
@@ -549,7 +550,8 @@ async function processMicrodataQuestion(questionEl, faqs, baseUrl, processing) {
   let rawQuestion = '';
   const nameEl = questionEl.querySelector('[itemprop="name"]');
   if (nameEl) {
-    rawQuestion = nameEl.textContent || nameEl.getAttribute('content') || '';
+    // Use .text for node-html-parser, not .textContent
+    rawQuestion = nameEl.text || nameEl.getAttribute('content') || '';
   }
   
   const processedQuestion = processQuestion(rawQuestion, processing);
@@ -609,10 +611,15 @@ async function extractEnhancedRdfa(root, baseUrl, processing) {
     }
   }
   
-  // Also try standalone Questions
-  const standaloneQuestions = root.querySelectorAll('[typeof*="Question"]:not([typeof*="FAQPage"] [typeof*="Question"])');
-  for (const q of standaloneQuestions) {
-    await processRdfaQuestion(q, faqs, baseUrl, processing);
+  // Also try standalone Questions (simpler approach)
+  const allQuestions = root.querySelectorAll('[typeof*="Question"]');
+  const processedIds = new Set(faqs.map(f => f.id).filter(Boolean));
+  
+  for (const q of allQuestions) {
+    const id = q.getAttribute('id') || q.getAttribute('resource')?.split('#').pop();
+    if (!processedIds.has(id)) {
+      await processRdfaQuestion(q, faqs, baseUrl, processing);
+    }
   }
   
   return { faqs, metadata: { warnings } };
@@ -630,7 +637,8 @@ async function processRdfaQuestion(questionEl, faqs, baseUrl, processing) {
   // Get question text
   const nameEl = questionEl.querySelector('[property="name"], [property="schema:name"]');
   if (!nameEl) return;
-  const rawQuestion = nameEl.textContent || nameEl.getAttribute('content') || '';
+  // Use .text for node-html-parser
+  const rawQuestion = nameEl.text || nameEl.getAttribute('content') || '';
   
   const processedQuestion = processQuestion(rawQuestion, processing);
   if (!processedQuestion) return;
@@ -684,7 +692,7 @@ function processQuestion(raw, processing) {
   return raw;
 }
 
-// Process answer with sanitization and image handling
+// Process answer with sanitization and image handling (simplified for Workers)
 async function processAnswer(raw, baseUrl, processing) {
   if (!raw) return '';
   
@@ -693,52 +701,48 @@ async function processAnswer(raw, baseUrl, processing) {
   // First decode entities
   raw = decodeHtmlEntities(raw);
   
-  // Create temporary DOM for processing
-  const tempDiv = document.createElement('div');
-  tempDiv.innerHTML = raw;
+  // Parse the HTML string
+  const tempRoot = parse(raw);
   
   // Remove dangerous elements
   const dangerousTags = ['script', 'style', 'iframe', 'object', 'embed', 'form', 'input', 'button'];
   dangerousTags.forEach(tag => {
-    const elements = tempDiv.querySelectorAll(tag);
+    const elements = tempRoot.querySelectorAll(tag);
     elements.forEach(el => el.remove());
   });
   
-  // Remove event handlers
-  const allElements = tempDiv.querySelectorAll('*');
+  // Remove event handlers by rebuilding clean HTML
+  const allElements = tempRoot.querySelectorAll('*');
   allElements.forEach(el => {
-    // Remove all attributes starting with 'on'
-    Array.from(el.attributes).forEach(attr => {
-      if (attr.name.startsWith('on') || attr.value.includes('javascript:')) {
-        el.removeAttribute(attr.name);
+    // Get all attributes
+    const attrs = el.attributes;
+    Object.keys(attrs).forEach(attrName => {
+      if (attrName.startsWith('on') || attrs[attrName].includes('javascript:')) {
+        el.removeAttribute(attrName);
       }
     });
   });
   
   // Process links - make relative URLs absolute
-  const links = tempDiv.querySelectorAll('a');
-  let relativeUrlsFixed = 0;
+  const links = tempRoot.querySelectorAll('a');
   links.forEach(link => {
     const href = link.getAttribute('href');
     if (href && !href.startsWith('http') && !href.startsWith('#') && !href.startsWith('mailto:')) {
       try {
         const absolute = new URL(href, baseUrl).href;
         link.setAttribute('href', absolute);
-        relativeUrlsFixed++;
+        processing.relativeUrlsFixed++;
       } catch (e) {
         // Invalid URL, remove href
         link.removeAttribute('href');
       }
     }
   });
-  processing.relativeUrlsFixed += relativeUrlsFixed;
   
   // Process images
-  const images = tempDiv.querySelectorAll('img');
+  const images = tempRoot.querySelectorAll('img');
   processing.imagesProcessed += images.length;
   
-  // Process up to 10 images with verification
-  let imageCheckCount = 0;
   for (const img of images) {
     let src = img.getAttribute('src');
     
@@ -786,53 +790,21 @@ async function processAnswer(raw, baseUrl, processing) {
       img.setAttribute('alt', 'FAQ image');
     }
     
-    // Verify image availability (limit to 10 checks)
-    if (imageCheckCount < 10) {
-      imageCheckCount++;
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 2000); // 2 second timeout
-        
-        const response = await fetch(src, {
-          method: 'HEAD',
-          signal: controller.signal,
-          // Note: no-cors mode means we can't read response, but that's OK
-          mode: 'no-cors'
-        });
-        
-        clearTimeout(timeoutId);
-        
-        // With no-cors, we can't actually check if it's OK, so mark as unverified
-        img.setAttribute('data-verified', 'unverified');
-        processing.unverifiedImages++;
-        
-      } catch (e) {
-        // Timeout or network error
-        if (e.name === 'AbortError') {
-          img.setAttribute('data-verified', 'timeout');
-          processing.unverifiedImages++;
-        } else {
-          img.setAttribute('data-broken', 'true');
-          img.setAttribute('alt', img.getAttribute('alt') || 'Image unavailable');
-          processing.brokenImages++;
-        }
-      }
-    } else {
-      // Skip verification for remaining images
-      img.setAttribute('data-verified', 'skipped');
-    }
+    // Mark all images as unverified in Workers environment
+    img.setAttribute('data-verified', 'unverified');
+    processing.unverifiedImages++;
   }
   
-  // Clean up empty paragraphs and normalize
-  const paragraphs = tempDiv.querySelectorAll('p');
+  // Clean up empty paragraphs
+  const paragraphs = tempRoot.querySelectorAll('p');
   paragraphs.forEach(p => {
-    if (!p.textContent.trim() && !p.querySelector('img')) {
+    if (!p.text.trim() && !p.querySelector('img')) {
       p.remove();
     }
   });
   
   // Get cleaned HTML
-  let cleaned = tempDiv.innerHTML;
+  let cleaned = tempRoot.innerHTML;
   
   // Final length check
   if (cleaned.length > 5000) {
