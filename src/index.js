@@ -429,9 +429,40 @@ async function extractEnhancedJsonLd(root, baseUrl, processing) {
     console.log(`[JSON-LD] Processing script ${scriptIndex + 1}/${scripts.length}`);
     
     try {
-      let content = script.innerHTML.trim();
-      console.log(`[JSON-LD] Script content length: ${content.length} characters`);
+      // Debug: Check different ways to get content
+      let content = script.innerHTML || '';
+      console.log(`[JSON-LD] innerHTML length: ${content.length}`);
+      
+      // Try textContent if innerHTML is empty
+      if (!content.trim()) {
+        content = script.textContent || '';
+        console.log(`[JSON-LD] Trying textContent, length: ${content.length}`);
+      }
+      
+      // Try rawText for node-html-parser
+      if (!content.trim() && script.rawText) {
+        content = script.rawText || '';
+        console.log(`[JSON-LD] Trying rawText, length: ${content.length}`);
+      }
+      
+      // Try innerText for node-html-parser
+      if (!content.trim() && script.innerText) {
+        content = script.innerText || '';
+        console.log(`[JSON-LD] Trying innerText, length: ${content.length}`);
+      }
+      
+      // Debug: Log the actual script element structure
+      console.log(`[JSON-LD] Script element keys:`, Object.keys(script));
+      console.log(`[JSON-LD] Script childNodes length:`, script.childNodes ? script.childNodes.length : 'no childNodes');
+      
+      content = content.trim();
+      console.log(`[JSON-LD] Final content length: ${content.length} characters`);
       console.log(`[JSON-LD] First 200 chars: ${content.substring(0, 200)}...`);
+      
+      if (!content) {
+        console.log('[JSON-LD] Script has no content, skipping');
+        continue;
+      }
       
       let data;
       
