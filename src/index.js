@@ -429,12 +429,12 @@ async function extractEnhancedJsonLd(root, baseUrl, processing) {
     console.log(`[JSON-LD] Processing script ${scriptIndex + 1}/${scripts.length}`);
     
     try {
-      // For node-html-parser, use .text property
-      let content = script.text || '';
+      // For node-html-parser, try multiple properties to get content
+      let content = script.innerHTML || script.innerText || script.rawText || script.text || '';
       
-      // If text is empty, try innerHTML as fallback
-      if (!content.trim()) {
-        content = script.innerHTML || '';
+      // If still empty, try getting the text content directly
+      if (!content.trim() && script.childNodes && script.childNodes.length > 0) {
+        content = script.childNodes[0].rawText || script.childNodes[0].text || '';
       }
       
       content = content.trim();
