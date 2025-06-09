@@ -1,11 +1,12 @@
 import { parse } from 'node-html-parser';
 
 /**
- * Enhanced FAQ Schema Extraction Proxy Worker (Fixed)
+ * Enhanced FAQ Schema Extraction Proxy Worker with Debug Logging
  * - Handles nested schemas, comments, multiple formats
  * - Processes images with verification
  * - Robust HTML sanitization
  * - Comprehensive metadata and warnings
+ * - EXTENSIVE DEBUG LOGGING
  */
 addEventListener('fetch', e => e.respondWith(handleRequest(e.request, e)));
 
@@ -260,9 +261,13 @@ async function handleRequest(request, event) {
       dataUrisRejected: 0
     };
     
+    console.log('=== Starting FAQ extraction ===');
+    
     // 1) Try Enhanced JSON-LD
     try {
+      console.log('Attempting JSON-LD extraction...');
       const { faqs, metadata } = await extractEnhancedJsonLd(root, targetUrl.href, processing);
+      console.log(`JSON-LD extraction complete. Found ${faqs.length} FAQs`);
       if (faqs.length > 0) {
         allFaqs = allFaqs.concat(faqs);
         schemaTypesFound.push('JSON-LD');
@@ -274,7 +279,9 @@ async function handleRequest(request, event) {
     
     // 2) Try Enhanced Microdata
     try {
+      console.log('Attempting Microdata extraction...');
       const { faqs, metadata } = await extractEnhancedMicrodata(root, targetUrl.href, processing);
+      console.log(`Microdata extraction complete. Found ${faqs.length} FAQs`);
       if (faqs.length > 0) {
         allFaqs = allFaqs.concat(faqs);
         schemaTypesFound.push('Microdata');
@@ -286,7 +293,9 @@ async function handleRequest(request, event) {
     
     // 3) Try Enhanced RDFa
     try {
+      console.log('Attempting RDFa extraction...');
       const { faqs, metadata } = await extractEnhancedRdfa(root, targetUrl.href, processing);
+      console.log(`RDFa extraction complete. Found ${faqs.length} FAQs`);
       if (faqs.length > 0) {
         allFaqs = allFaqs.concat(faqs);
         schemaTypesFound.push('RDFa');
@@ -296,8 +305,12 @@ async function handleRequest(request, event) {
       console.error('Enhanced RDFa extraction failed:', e);
     }
     
+    console.log(`Total FAQs before deduplication: ${allFaqs.length}`);
+    
     // Deduplicate and limit
     allFaqs = dedupeEnhanced(allFaqs);
+    
+    console.log(`Total FAQs after deduplication: ${allFaqs.length}`);
     
     // Limit to 50 FAQs
     if (allFaqs.length > 50) {
@@ -324,6 +337,7 @@ async function handleRequest(request, event) {
     
     if (allFaqs.length > 0) {
       console.log(`Successfully extracted ${allFaqs.length} FAQs from ${url}`);
+      console.log('First FAQ:', JSON.stringify(allFaqs[0], null, 2));
       return new Response(JSON.stringify({
         success: true,
         source: url,
@@ -406,17 +420,27 @@ async function extractEnhancedJsonLd(root, baseUrl, processing) {
   const warnings = [];
   const scripts = root.querySelectorAll('script[type="application/ld+json"]');
   
-  for (const script of scripts) {
+  console.log(`[JSON-LD] Found ${scripts.length} JSON-LD scripts`);
+  
+  for (let scriptIndex = 0; scriptIndex < scripts.length; scriptIndex++) {
+    const script = scripts[scriptIndex];
+    console.log(`[JSON-LD] Processing script ${scriptIndex + 1}/${scripts.length}`);
+    
     try {
       let content = script.innerHTML.trim();
+      console.log(`[JSON-LD] Script content length: ${content.length} characters`);
+      console.log(`[JSON-LD] First 200 chars: ${content.substring(0, 200)}...`);
+      
       let data;
       
       // First, try to parse without any preprocessing (for valid escaped JSON)
       try {
         data = JSON.parse(content);
+        console.log('[JSON-LD] Successfully parsed JSON-LD without preprocessing');
       } catch (initialError) {
         // Only preprocess if the initial parse fails
-        console.log('Initial JSON parse failed, applying preprocessing...');
+        console.log('[JSON-LD] Initial JSON parse failed:', initialError.message);
+        console.log('[JSON-LD] Applying preprocessing...');
         
         // Preprocess to handle comments and common issues
         content = content
@@ -435,56 +459,87 @@ async function extractEnhancedJsonLd(root, baseUrl, processing) {
         // Try parsing again after preprocessing
         try {
           data = JSON.parse(content);
+          console.log('[JSON-LD] Successfully parsed after preprocessing');
         } catch (preprocessError) {
-          console.warn('Failed to parse JSON-LD even after preprocessing:', preprocessError.message);
-          console.warn('Content sample:', content.substring(0, 200) + '...');
+          console.warn('[JSON-LD] Failed to parse JSON-LD even after preprocessing:', preprocessError.message);
+          console.warn('[JSON-LD] Content sample:', content.substring(0, 200) + '...');
           continue; // Skip this script
         }
       }
       
+      console.log('[JSON-LD] Parsed data type:', data['@type']);
+      
       // Process the parsed data
       const arr = Array.isArray(data) ? data : [data];
+      console.log(`[JSON-LD] Processing ${arr.length} objects`);
       
-      for (const obj of arr) {
+      for (let objIndex = 0; objIndex < arr.length; objIndex++) {
+        const obj = arr[objIndex];
+        console.log(`[JSON-LD] Processing object ${objIndex + 1}/${arr.length} with type: ${obj['@type']}`);
         await traverseEnhancedLd(obj, faqs, baseUrl, processing);
       }
       
+      console.log(`[JSON-LD] After processing script ${scriptIndex + 1}, total FAQs: ${faqs.length}`);
+      
     } catch (e) {
-      console.error('Unexpected error in JSON-LD extraction:', e.message);
+      console.error('[JSON-LD] Unexpected error in JSON-LD extraction:', e.message);
       warnings.push(`Failed to process JSON-LD: ${e.message}`);
     }
   }
   
+  console.log(`[JSON-LD] Total FAQs extracted: ${faqs.length}`);
   return { faqs, metadata: { warnings } };
 }
 
 // Enhanced traversal for complex JSON-LD structures
 async function traverseEnhancedLd(obj, out, baseUrl, processing, depth = 0) {
-  if (!obj || typeof obj !== 'object' || depth > 5) return;
+  if (!obj || typeof obj !== 'object' || depth > 5) {
+    console.log(`[Traverse] Skipping at depth ${depth} - obj null or too deep`);
+    return;
+  }
   
   const type = obj['@type'];
+  console.log(`[Traverse] Depth ${depth}, type: ${type}`);
   
   // Check if this is or contains FAQPage
   if ((Array.isArray(type) ? type.includes('FAQPage') : type === 'FAQPage') ||
       (obj.mainEntity && obj.mainEntity['@type'] === 'FAQPage')) {
     
+    console.log('[Traverse] Found FAQPage!');
+    
     // Find the FAQ content
     let faqContent = obj;
     if (obj.mainEntity && obj.mainEntity['@type'] === 'FAQPage') {
       faqContent = obj.mainEntity;
+      console.log('[Traverse] FAQPage is in mainEntity');
     }
     
     let mainEntity = faqContent.mainEntity || faqContent['mainEntity'] || faqContent.hasPart;
     if (mainEntity) {
       mainEntity = Array.isArray(mainEntity) ? mainEntity : [mainEntity];
+      console.log(`[Traverse] Found ${mainEntity.length} items in mainEntity`);
       
-      for (const q of mainEntity) {
-        if (!q['@type'] || !q['@type'].includes('Question')) continue;
+      for (let qIndex = 0; qIndex < mainEntity.length; qIndex++) {
+        const q = mainEntity[qIndex];
+        console.log(`[Traverse] Processing question ${qIndex + 1}/${mainEntity.length}`);
+        console.log(`[Traverse] Question type: ${q['@type']}`);
+        
+        if (!q['@type'] || !q['@type'].includes('Question')) {
+          console.log('[Traverse] Skipping - not a Question type');
+          continue;
+        }
         
         // Process question
         const rawQuestion = q.name || q.question || '';
+        console.log(`[Traverse] Raw question: "${rawQuestion}"`);
+        
         const processedQuestion = processQuestion(rawQuestion, processing);
-        if (!processedQuestion) continue;
+        console.log(`[Traverse] Processed question: "${processedQuestion}"`);
+        
+        if (!processedQuestion) {
+          console.log('[Traverse] Question processing returned empty, skipping');
+          continue;
+        }
         
         // Extract answer - try multiple properties
         let rawAnswer = '';
@@ -494,16 +549,22 @@ async function traverseEnhancedLd(obj, out, baseUrl, processing, depth = 0) {
         if (accepted) {
           rawAnswer = typeof accepted === 'string' ? accepted : 
                      (accepted.text || accepted.answerText || accepted.description || '');
+          console.log(`[Traverse] Found acceptedAnswer, length: ${rawAnswer.length}`);
         } else if (suggested && suggested.length > 0) {
           const firstSuggested = suggested[0];
           rawAnswer = typeof firstSuggested === 'string' ? firstSuggested :
                      (firstSuggested.text || firstSuggested.answerText || '');
+          console.log(`[Traverse] Found suggestedAnswer, length: ${rawAnswer.length}`);
         }
         
-        if (!rawAnswer) continue;
+        if (!rawAnswer) {
+          console.log('[Traverse] No answer found, skipping');
+          continue;
+        }
         
         // Process answer with sanitization and image handling
         const processedAnswer = await processAnswer(rawAnswer, baseUrl, processing);
+        console.log(`[Traverse] Processed answer length: ${processedAnswer.length}`);
         
         // Extract ID/anchor
         let id = q['@id'] || q.id || q.url || null;
@@ -513,18 +574,23 @@ async function traverseEnhancedLd(obj, out, baseUrl, processing, depth = 0) {
         if (id) {
           id = sanitizeAnchor(id);
         }
+        console.log(`[Traverse] FAQ ID: ${id || 'none'}`);
         
         out.push({ 
           question: processedQuestion,
           answer: processedAnswer,
           id: id
         });
+        console.log(`[Traverse] Added FAQ. Total count: ${out.length}`);
       }
+    } else {
+      console.log('[Traverse] No mainEntity found in FAQPage');
     }
   }
   
   // Traverse nested structures
   if (obj['@graph'] && Array.isArray(obj['@graph'])) {
+    console.log(`[Traverse] Found @graph with ${obj['@graph'].length} items`);
     for (const item of obj['@graph']) {
       await traverseEnhancedLd(item, out, baseUrl, processing, depth + 1);
     }
@@ -532,6 +598,7 @@ async function traverseEnhancedLd(obj, out, baseUrl, processing, depth = 0) {
   
   // Check for nested WebPage > mainEntity patterns
   if (obj.mainEntity && depth < 3) {
+    console.log('[Traverse] Found mainEntity, traversing deeper');
     await traverseEnhancedLd(obj.mainEntity, out, baseUrl, processing, depth + 1);
   }
 }
@@ -541,10 +608,15 @@ async function extractEnhancedMicrodata(root, baseUrl, processing) {
   const faqs = [];
   const warnings = [];
   
+  console.log('[Microdata] Starting extraction');
+  
   // First try FAQPage containers
   const faqPages = root.querySelectorAll('[itemscope][itemtype*="FAQPage"]');
+  console.log(`[Microdata] Found ${faqPages.length} FAQPage containers`);
+  
   for (const faqPage of faqPages) {
     const questions = faqPage.querySelectorAll('[itemscope][itemtype*="Question"]');
+    console.log(`[Microdata] Found ${questions.length} questions in FAQPage`);
     for (const q of questions) {
       await processMicrodataQuestion(q, faqs, baseUrl, processing);
     }
@@ -552,6 +624,8 @@ async function extractEnhancedMicrodata(root, baseUrl, processing) {
   
   // Also try standalone Questions (but simpler approach)
   const allQuestions = root.querySelectorAll('[itemscope][itemtype*="Question"]');
+  console.log(`[Microdata] Found ${allQuestions.length} total Question elements`);
+  
   const processedIds = new Set(faqs.map(f => f.id).filter(Boolean));
   
   for (const q of allQuestions) {
@@ -561,16 +635,20 @@ async function extractEnhancedMicrodata(root, baseUrl, processing) {
     }
   }
   
+  console.log(`[Microdata] Total FAQs extracted: ${faqs.length}`);
   return { faqs, metadata: { warnings } };
 }
 
 async function processMicrodataQuestion(questionEl, faqs, baseUrl, processing) {
+  console.log('[Microdata] Processing question element');
+  
   // Get ID
   const id = sanitizeAnchor(
     questionEl.getAttribute('id') || 
     questionEl.getAttribute('itemid')?.split('#').pop() || 
     null
   );
+  console.log(`[Microdata] Question ID: ${id || 'none'}`);
   
   // Get question text - try multiple selectors
   let rawQuestion = '';
@@ -578,10 +656,14 @@ async function processMicrodataQuestion(questionEl, faqs, baseUrl, processing) {
   if (nameEl) {
     // Use .text for node-html-parser, not .textContent
     rawQuestion = nameEl.text || nameEl.getAttribute('content') || '';
+    console.log(`[Microdata] Found question name: "${rawQuestion}"`);
   }
   
   const processedQuestion = processQuestion(rawQuestion, processing);
-  if (!processedQuestion) return;
+  if (!processedQuestion) {
+    console.log('[Microdata] No question text found, skipping');
+    return;
+  }
   
   // Get answer - try multiple approaches
   let rawAnswer = '';
@@ -590,6 +672,7 @@ async function processMicrodataQuestion(questionEl, faqs, baseUrl, processing) {
   const directTextEl = questionEl.querySelector('[itemprop="text"]');
   if (directTextEl) {
     rawAnswer = directTextEl.innerHTML;
+    console.log(`[Microdata] Found direct answer text, length: ${rawAnswer.length}`);
   } else {
     // Inside acceptedAnswer
     const acceptedAnswerEl = questionEl.querySelector('[itemprop="acceptedAnswer"]');
@@ -597,9 +680,11 @@ async function processMicrodataQuestion(questionEl, faqs, baseUrl, processing) {
       const textEl = acceptedAnswerEl.querySelector('[itemprop="text"]');
       if (textEl) {
         rawAnswer = textEl.innerHTML;
+        console.log(`[Microdata] Found answer in acceptedAnswer/text, length: ${rawAnswer.length}`);
       } else {
         // Sometimes the acceptedAnswer itself contains the text
         rawAnswer = acceptedAnswerEl.innerHTML;
+        console.log(`[Microdata] Using acceptedAnswer innerHTML, length: ${rawAnswer.length}`);
       }
     }
   }
@@ -609,10 +694,14 @@ async function processMicrodataQuestion(questionEl, faqs, baseUrl, processing) {
     const suggestedEl = questionEl.querySelector('[itemprop="suggestedAnswer"] [itemprop="text"]');
     if (suggestedEl) {
       rawAnswer = suggestedEl.innerHTML;
+      console.log(`[Microdata] Found answer in suggestedAnswer, length: ${rawAnswer.length}`);
     }
   }
   
-  if (!rawAnswer) return;
+  if (!rawAnswer) {
+    console.log('[Microdata] No answer found, skipping');
+    return;
+  }
   
   const processedAnswer = await processAnswer(rawAnswer, baseUrl, processing);
   
@@ -621,6 +710,7 @@ async function processMicrodataQuestion(questionEl, faqs, baseUrl, processing) {
     answer: processedAnswer,
     id: id
   });
+  console.log(`[Microdata] Added FAQ. Total count: ${faqs.length}`);
 }
 
 // Enhanced RDFa extraction
@@ -628,10 +718,15 @@ async function extractEnhancedRdfa(root, baseUrl, processing) {
   const faqs = [];
   const warnings = [];
   
+  console.log('[RDFa] Starting extraction');
+  
   // Try FAQPage containers first
   const faqPages = root.querySelectorAll('[typeof*="FAQPage"], [typeof*="https://schema.org/FAQPage"]');
+  console.log(`[RDFa] Found ${faqPages.length} FAQPage containers`);
+  
   for (const faqPage of faqPages) {
     const questions = faqPage.querySelectorAll('[typeof*="Question"]');
+    console.log(`[RDFa] Found ${questions.length} questions in FAQPage`);
     for (const q of questions) {
       await processRdfaQuestion(q, faqs, baseUrl, processing);
     }
@@ -639,6 +734,8 @@ async function extractEnhancedRdfa(root, baseUrl, processing) {
   
   // Also try standalone Questions (simpler approach)
   const allQuestions = root.querySelectorAll('[typeof*="Question"]');
+  console.log(`[RDFa] Found ${allQuestions.length} total Question elements`);
+  
   const processedIds = new Set(faqs.map(f => f.id).filter(Boolean));
   
   for (const q of allQuestions) {
@@ -648,10 +745,13 @@ async function extractEnhancedRdfa(root, baseUrl, processing) {
     }
   }
   
+  console.log(`[RDFa] Total FAQs extracted: ${faqs.length}`);
   return { faqs, metadata: { warnings } };
 }
 
 async function processRdfaQuestion(questionEl, faqs, baseUrl, processing) {
+  console.log('[RDFa] Processing question element');
+  
   // Get ID
   const id = sanitizeAnchor(
     questionEl.getAttribute('id') || 
@@ -659,24 +759,37 @@ async function processRdfaQuestion(questionEl, faqs, baseUrl, processing) {
     questionEl.getAttribute('about')?.split('#').pop() ||
     null
   );
+  console.log(`[RDFa] Question ID: ${id || 'none'}`);
   
   // Get question text
   const nameEl = questionEl.querySelector('[property="name"], [property="schema:name"]');
-  if (!nameEl) return;
+  if (!nameEl) {
+    console.log('[RDFa] No name element found');
+    return;
+  }
+  
   // Use .text for node-html-parser
   const rawQuestion = nameEl.text || nameEl.getAttribute('content') || '';
+  console.log(`[RDFa] Found question: "${rawQuestion}"`);
   
   const processedQuestion = processQuestion(rawQuestion, processing);
-  if (!processedQuestion) return;
+  if (!processedQuestion) {
+    console.log('[RDFa] Question processing returned empty');
+    return;
+  }
   
   // Get answer - try multiple selectors
   let rawAnswer = '';
   const textEl = questionEl.querySelector('[property="text"], [property="schema:text"], [property="acceptedAnswer"] [property="text"]');
   if (textEl) {
     rawAnswer = textEl.innerHTML;
+    console.log(`[RDFa] Found answer, length: ${rawAnswer.length}`);
   }
   
-  if (!rawAnswer) return;
+  if (!rawAnswer) {
+    console.log('[RDFa] No answer found');
+    return;
+  }
   
   const processedAnswer = await processAnswer(rawAnswer, baseUrl, processing);
   
@@ -685,18 +798,26 @@ async function processRdfaQuestion(questionEl, faqs, baseUrl, processing) {
     answer: processedAnswer,
     id: id
   });
+  console.log(`[RDFa] Added FAQ. Total count: ${faqs.length}`);
 }
 
 // Process question text
 function processQuestion(raw, processing) {
-  if (!raw) return '';
+  console.log(`[ProcessQ] Input: "${raw}"`);
+  
+  if (!raw) {
+    console.log('[ProcessQ] Empty input');
+    return '';
+  }
   
   // Decode HTML entities
   raw = decodeHtmlEntities(raw);
+  console.log(`[ProcessQ] After decode: "${raw}"`);
   
   // Check if contains HTML
   if (/<[^>]+>/.test(raw)) {
     processing.questionsWithHtmlStripped++;
+    console.log('[ProcessQ] Contains HTML, will strip');
   }
   
   // Strip all HTML tags
@@ -704,6 +825,7 @@ function processQuestion(raw, processing) {
   
   // Normalize whitespace
   raw = raw.replace(/\s+/g, ' ').trim();
+  console.log(`[ProcessQ] After cleanup: "${raw}"`);
   
   // Limit length
   if (raw.length > 300) {
@@ -713,19 +835,27 @@ function processQuestion(raw, processing) {
     if (lastSpace > 250) {
       raw = raw.substring(0, lastSpace) + '...';
     }
+    console.log(`[ProcessQ] Truncated to: "${raw}"`);
   }
   
+  console.log(`[ProcessQ] Final output: "${raw}"`);
   return raw;
 }
 
 // Process answer with sanitization and image handling (simplified for Workers)
 async function processAnswer(raw, baseUrl, processing) {
-  if (!raw) return '';
+  console.log(`[ProcessA] Input length: ${raw.length}`);
+  
+  if (!raw) {
+    console.log('[ProcessA] Empty input');
+    return '';
+  }
   
   processing.answersWithHtmlSanitized++;
   
   // First decode entities
   raw = decodeHtmlEntities(raw);
+  console.log(`[ProcessA] After decode length: ${raw.length}`);
   
   // Parse the HTML string
   const tempRoot = parse(raw);
@@ -768,6 +898,7 @@ async function processAnswer(raw, baseUrl, processing) {
   // Process images
   const images = tempRoot.querySelectorAll('img');
   processing.imagesProcessed += images.length;
+  console.log(`[ProcessA] Found ${images.length} images`);
   
   for (const img of images) {
     let src = img.getAttribute('src');
@@ -831,6 +962,7 @@ async function processAnswer(raw, baseUrl, processing) {
   
   // Get cleaned HTML
   let cleaned = tempRoot.innerHTML;
+  console.log(`[ProcessA] Cleaned HTML length: ${cleaned.length}`);
   
   // Final length check
   if (cleaned.length > 5000) {
@@ -838,8 +970,10 @@ async function processAnswer(raw, baseUrl, processing) {
     // Try to close any open tags
     cleaned = cleaned.replace(/<[^>]*$/, '') + '... (truncated)';
     processing.truncatedAnswers++;
+    console.log('[ProcessA] Answer truncated to 5000 chars');
   }
   
+  console.log(`[ProcessA] Final output length: ${cleaned.length}`);
   return cleaned;
 }
 
@@ -848,11 +982,14 @@ function sanitizeAnchor(id) {
   if (!id) return null;
   
   // Remove any dangerous characters
-  return id
+  const sanitized = id
     .replace(/[^a-zA-Z0-9_-]/g, '-')
     .replace(/-+/g, '-')
     .replace(/^-+|-+$/g, '')
     .substring(0, 100);
+  
+  console.log(`[Sanitize] Input: "${id}" Output: "${sanitized}"`);
+  return sanitized;
 }
 
 // Decode HTML entities
@@ -877,14 +1014,26 @@ function decodeHtmlEntities(text) {
 
 // Enhanced deduplication
 function dedupeEnhanced(arr) {
+  console.log(`[Dedupe] Input: ${arr.length} FAQs`);
+  
   const seen = new Map();
   const MAX_FAQS = 50;
   
-  return arr.filter((faq, index) => {
-    if (index >= MAX_FAQS) return false;
+  const result = arr.filter((faq, index) => {
+    if (index >= MAX_FAQS) {
+      console.log(`[Dedupe] Skipping FAQ ${index + 1} - exceeds limit`);
+      return false;
+    }
     
-    if (!faq.question || !faq.answer) return false;
-    if (faq.question.includes('${') || faq.answer.includes('${')) return false;
+    if (!faq.question || !faq.answer) {
+      console.log(`[Dedupe] Skipping FAQ ${index + 1} - missing question or answer`);
+      return false;
+    }
+    
+    if (faq.question.includes('${') || faq.answer.includes('${')) {
+      console.log(`[Dedupe] Skipping FAQ ${index + 1} - contains template variables`);
+      return false;
+    }
     
     // Create normalized key for comparison
     const key = faq.question.toLowerCase()
@@ -892,11 +1041,16 @@ function dedupeEnhanced(arr) {
       .replace(/\s+/g, ' ')
       .trim();
     
+    console.log(`[Dedupe] FAQ ${index + 1} normalized key: "${key}"`);
+    
     if (seen.has(key)) {
       // Keep the one with an ID if duplicate
       const existing = seen.get(key);
       if (!existing.id && faq.id) {
+        console.log(`[Dedupe] Replacing duplicate without ID with one that has ID: ${faq.id}`);
         seen.set(key, faq);
+      } else {
+        console.log(`[Dedupe] Skipping duplicate FAQ`);
       }
       return false;
     }
@@ -904,4 +1058,7 @@ function dedupeEnhanced(arr) {
     seen.set(key, faq);
     return true;
   });
+  
+  console.log(`[Dedupe] Output: ${result.length} FAQs`);
+  return result;
 }
