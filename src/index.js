@@ -410,7 +410,7 @@ async function extractEnhancedJsonLd(root, baseUrl, processing) {
     try {
       // Preprocess to handle comments and common issues
       let content = script.innerHTML
-        .replace(/^\s*\/\/.*$/gm, '')     // Remove // comments
+        .replace(/^[\s]*\/\/.*$/gm, '')   // More specific: only at line start
         .replace(/\/\*[\s\S]*?\*\//g, '') // Remove /* */ comments
         .replace(/[\u0000-\u001F\u007F-\u009F]/g, '') // Remove control chars
         .replace(/,\s*([}\]])/g, '$1')    // Remove trailing commas
