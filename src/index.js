@@ -3,10 +3,11 @@ import { parse } from 'node-html-parser';
 /**
  * FAQ Schema Extraction Proxy Worker - HTML Parser Version
  * Uses node-html-parser for robust HTML parsing instead of regex
+ * Now with IP-based rate limiting via Cloudflare KV
  */
-addEventListener('fetch', e => e.respondWith(handleRequest(e.request)));
+addEventListener('fetch', e => e.respondWith(handleRequest(e.request, e)));
 
-async function handleRequest(request) {
+async function handleRequest(request, event) {
   // Extract origin/referer early for logging
   const origin = request.headers.get('Origin');
   const referer = request.headers.get('Referer');
@@ -62,6 +63,71 @@ async function handleRequest(request) {
         headers: { 'Content-Type': 'application/json', ...cors },
       });
     }
+  }
+
+  // RATE LIMITING - Check before processing request
+  const DAILY_LIMIT = 100; // Adjust this as needed
+  const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const today = new Date().toISOString().split('T')[0];
+  const rateLimitKey = `faq-proxy:${clientIP}:${today}`;
+  
+  try {
+    // Get current usage from KV
+    let usageData = await event.env.FAQ_RATE_LIMITS.get(rateLimitKey, { type: 'json' });
+    if (!usageData) {
+      usageData = { count: 0, date: today };
+    }
+    
+    // Check if rate limit exceeded
+    if (usageData.count >= DAILY_LIMIT) {
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      tomorrow.setHours(0, 0, 0, 0);
+      
+      console.log(`Rate limit exceeded for IP ${clientIP}: ${usageData.count}/${DAILY_LIMIT}`);
+      
+      return new Response(JSON.stringify({
+        rateLimited: true,
+        error: `Daily extraction limit reached. You can extract up to ${DAILY_LIMIT} pages per day.`,
+        resetTime: tomorrow.getTime(),
+        limit: DAILY_LIMIT,
+        used: usageData.count,
+        resetIn: Math.ceil((tomorrow.getTime() - Date.now()) / 1000 / 60), // minutes until reset
+        success: false,
+        metadata: {
+          warning: "Rate limit exceeded. Please try again tomorrow.",
+          terms: "By using this service, you agree not to violate any website's terms of service."
+        }
+      }), {
+        status: 429,
+        headers: { 
+          'Content-Type': 'application/json',
+          'X-RateLimit-Limit': DAILY_LIMIT.toString(),
+          'X-RateLimit-Remaining': '0',
+          'X-RateLimit-Reset': tomorrow.getTime().toString(),
+          ...cors 
+        },
+      });
+    }
+    
+    // Increment usage counter (will be saved after successful extraction)
+    usageData.count++;
+    
+    // Store updated usage after request completes
+    event.waitUntil(
+      event.env.FAQ_RATE_LIMITS.put(rateLimitKey, JSON.stringify(usageData), {
+        expirationTtl: 86400 // 24 hours
+      })
+    );
+    
+    // Add rate limit headers to response
+    const remaining = DAILY_LIMIT - usageData.count;
+    cors['X-RateLimit-Limit'] = DAILY_LIMIT.toString();
+    cors['X-RateLimit-Remaining'] = Math.max(0, remaining).toString();
+    
+  } catch (kvError) {
+    console.error('KV rate limit error:', kvError);
+    // Continue without rate limiting if KV fails
   }
 
   const url = new URL(request.url).searchParams.get('url');
